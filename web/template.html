@@ -242,7 +242,7 @@
   const audio = (() => {
     const SCALE = [0, 2, 4, 7, 9]; // pentatonic: no bad intervals, even at random
     let ctx = null, comp = null, master = null;
-    let muted = false, lastT = -1;
+    let muted = false, unlocked = false, lastT = -1;
     const MIN_GAP = 1 / 55;
 
     function ensure() {
@@ -267,7 +267,9 @@
 
     function resume() {
       const c = ensure();
-      if (c && c.state === "suspended") c.resume().then(showState).catch(() => {});
+      if (!c) return;
+      unlocked = true;
+      if (c.state === "suspended") c.resume().then(showState).catch(() => {});
     }
 
     // Map a value to a pentatonic pitch across ~2.5 octaves.
@@ -277,7 +279,7 @@
     }
 
     function tone(freq, { type = "sine", dur = 0.05, gain = 0.03, bend = 1, delay = 0, force = false } = {}) {
-      if (muted) return;
+      if (muted || !unlocked) return;
       const c = ensure();
       if (!c) return;
       if (c.state === "suspended") c.resume().then(showState).catch(() => {});
@@ -324,19 +326,28 @@
   })();
 
   const eng = {
-    base: null, vals: null, trace: null, total: 0, i: 0,
-    settled: null, heat: null, lanes: [], active: [-1, -1], pivot: -1, gate: [-1, -1],
-    cmp: 0, swaps: 0, last: "", acc: 0, playing: false, maxV: 1, ms: null, quiet: false,
-    mode: "trace", lapse: null, sortedOk: true,
+    base: null, mode: "trace", events: null, total: 0, i: 0,
+    vals: null, settled: null, heat: null, lanes: [], active: [-1, -1], pivot: -1, gate: [-1, -1],
+    live: null, cmp: 0, swaps: 0, last: "", acc: 0, playing: false, maxV: 1, ms: null,
+    quiet: false, sortedOk: true,
   };
 
-  const speedOf = (v) => Math.pow(10, 1 + (v / 100) * 4); // 10 .. 100k steps/s
+  // Trace mode plays stored interactions (10 .. 100k/s); live mode drives the
+  // engine directly, so it can go much faster (1k .. 10M interactions/s).
+  const speedOf = (v) =>
+    Math.pow(10, (eng.mode === "live" ? 3 : 1) + (v / 100) * 4);
 
-  /* Per-step tracing is O(n log n) records, so it is capped. Above the cap the
-   * wasm module samples strided snapshots instead (time-lapse mode). */
-  const TRACE_MAX_N = 8192;
-  const LAPSE_FRAMES = 256;
-  const LAPSE_BUCKETS = 512;
+  /*
+   * The wasm engine is resumable: eng_batch(k) advances the sort by up to k
+   * interactions and leaves the continuation inside wasm. Nothing is skipped
+   * and nothing O(n log n) is buffered. Up to TRACE_MAX_N the viewer also
+   * keeps the interaction stream in JS, which buys exact scrubbing; above
+   * that it reads the live array through snapshot() on every frame.
+   */
+  const TRACE_MAX_N = 32768;
+  const MAX_STORED_EVENTS = 5000000;
+  const BATCH_EVENTS = 200000;
+  const SNAP_BUCKETS = 512;
   const maxN = () => (wasm ? wasm.max_n() : 1048576);
   const sizeFromSlider = (v) =>
     Math.max(16, Math.min(maxN(), Math.round(16 * Math.pow(2, (v / 100) * 16))));
@@ -351,44 +362,176 @@
     return out;
   }
 
-  function sortInWasm(values) {
-    const n = values.length;
-    const mem = wasm.memory;
-    const arr = new Int32Array(mem.buffer, wasm.arr_ptr(), Math.max(n, 1));
-    arr.set(values);
-    wasm.ssort(n);
-    const len = wasm.trace_len();
-    const view = new Uint32Array(mem.buffer, wasm.trace_ptr(), len * 2);
-    return {
-      trace: new Uint32Array(view),
-      cmp: wasm.cmp_total(),
-      swaps: wasm.swap_total(),
-      overflow: wasm.trace_over(),
-      sorted: new Int32Array(new Int32Array(mem.buffer, wasm.arr_ptr(), n)),
-    };
+  const memView = (T, ptr, len) => new T(wasm.memory.buffer, ptr, len);
+
+  function loadIntoWasm(base) {
+    memView(Int32Array, wasm.arr_ptr(), Math.max(base.length, 1)).set(base);
+    wasm.begin_sort(base.length);
   }
 
-  function sortLapseInWasm(values) {
-    const n = values.length;
-    const mem = wasm.memory;
-    new Int32Array(mem.buffer, wasm.arr_ptr(), n).set(values);
-    const frames = wasm.ssort_lapse(n, LAPSE_FRAMES, LAPSE_BUCKETS);
-    const buckets = wasm.snap_bucket_count();
-    const view = new Int32Array(mem.buffer, wasm.snap_ptr(), frames * buckets);
-    return {
-      frames,
-      buckets,
-      data: new Int32Array(view),
-      f: 0,
-      cmp: wasm.cmp_total(),
-      swaps: wasm.swap_total(),
-      sorted: new Int32Array(mem.buffer, wasm.arr_ptr(), n),
-    };
+  /* Run to completion now, storing every interaction in JS. Returns null if
+   * the run would need more memory than we are willing to hold. */
+  function collectEvents(base) {
+    loadIntoWasm(base);
+    let buf = new Uint32Array(1 << 16);
+    let len = 0;
+    for (;;) {
+      const count = wasm.eng_batch(BATCH_EVENTS);
+      if (count > 0) {
+        const need = len + count * 3;
+        if (need > buf.length) {
+          const grow = new Uint32Array(Math.max(buf.length * 2, need));
+          grow.set(buf.subarray(0, len));
+          buf = grow;
+        }
+        buf.set(memView(Uint32Array, wasm.evbuf_ptr(), count * 3), len);
+        len = need;
+        if (len > MAX_STORED_EVENTS * 3) return null;
+      }
+      if (wasm.is_done()) break;
+      if (count === 0) return null;
+    }
+    return buf.subarray(0, len);
   }
 
-  function sortedView(view, n) {
+  function wasmSorted(n) {
+    const view = memView(Int32Array, wasm.arr_ptr(), Math.max(n, 1));
     for (let i = 1; i < n; i++) if (view[i - 1] > view[i]) return false;
     return true;
+  }
+
+  function refreshLiveSnap() {
+    if (!eng.live) return;
+    const got = wasm.snapshot(SNAP_BUCKETS);
+    eng.live.buckets = got;
+    eng.live.snap.set(memView(Int32Array, wasm.snap_ptr(), got));
+  }
+
+  function startLive(base) {
+    loadIntoWasm(base);
+    const n = base.length;
+    const logn = Math.log2(Math.max(n, 2));
+    eng.live = {
+      evDone: 0,
+      est: Math.round(3.3 * n * logn) + 8,
+      done: false,
+      snap: new Int32Array(SNAP_BUCKETS),
+      buckets: SNAP_BUCKETS,
+      lastOp: -1,
+      lastX: 0,
+      lastY: 0,
+      batchMs: 0,
+    };
+    refreshLiveSnap();
+  }
+
+  function audioForEvent(op, x, y) {
+    const n = eng.base ? eng.base.length : 0;
+    const arr = memView(Int32Array, wasm.arr_ptr(), Math.max(n, 1));
+    const vx = x < n ? arr[x] : 0;
+    switch (op) {
+      case OP.CMP:
+      case OP.CMPV: audio.compare(vx, eng.maxV); break;
+      case OP.SWAP: audio.swap(vx, eng.maxV); break;
+      case OP.PIVOT: audio.pivot(vx, eng.maxV); break;
+      case OP.SET: audio.settle(vx, eng.maxV); break;
+      case OP.DONE: audio.done(); break;
+      default: break;
+    }
+  }
+
+  function finishLive() {
+    const live = eng.live;
+    live.done = true;
+    eng.total = live.evDone;
+    eng.cmp = wasm.cmp_total();
+    eng.swaps = wasm.swap_total();
+    eng.ms = live.batchMs;
+    eng.sortedOk = wasmSorted(eng.base.length);
+    document.body.dataset.sorted = eng.sortedOk ? "1" : "0";
+    if (!eng.sortedOk) console.error("wasm sort mismatch — visualization would be wrong");
+    if (!eng.quiet) audio.done();
+    eng.last = `done — ${live.evDone.toLocaleString()} interactions`;
+    ui.scrub.max = String(Math.max(1, live.evDone));
+    eng.playing = false;
+    ui.play.textContent = "Play";
+  }
+
+  function describeEvent(op, x, y) {
+    const n = eng.base ? eng.base.length : 0;
+    const arr = memView(Int32Array, wasm.arr_ptr(), Math.max(n, 1));
+    const v = (i) => (i >= 0 && i < n ? arr[i] : 0);
+    switch (op) {
+      case OP.CMP: return `compare  a[${x}] ${v(x)} · a[${y}] ${v(y)}`;
+      case OP.CMPV: return `compare  a[${x}] ${v(x)} · pivot`;
+      case OP.SWAP: return `swap     a[${x}] ↔ a[${y}]`;
+      case OP.PIVOT: return `pivot    ${v(x)} parked at ${x}`;
+      case OP.RANGE: return `range    [${x}, ${y}) of ${y - x}`;
+      case OP.ORD: return `ordered  [${x}, ${y}) — skip`;
+      case OP.REV: return `reversed [${x}, ${y}) — flip`;
+      case OP.INS: return `settle   insertion sort [${x}, ${y})`;
+      case OP.SET: return `settled  [${x}, ${y})`;
+      default: return eng.last;
+    }
+  }
+
+  function stepLive(limit) {
+    const live = eng.live;
+    const t0 = performance.now();
+    const count = wasm.eng_batch(limit);
+    live.batchMs += performance.now() - t0;
+    eng.ms = live.batchMs;
+    if (count > 0) {
+      const ev = memView(Uint32Array, wasm.evbuf_ptr(), count * 3);
+      const k = (count - 1) * 3;
+      live.lastOp = ev[k];
+      live.lastX = ev[k + 1];
+      live.lastY = ev[k + 2];
+      eng.last = describeEvent(live.lastOp, live.lastX, live.lastY);
+      live.evDone = wasm.events_total();
+      eng.cmp = wasm.cmp_total();
+      eng.swaps = wasm.swap_total();
+      if (!eng.quiet) audioForEvent(live.lastOp, live.lastX, live.lastY);
+    }
+    if (wasm.is_done() && !live.done) {
+      finishLive();
+      return;
+    }
+    refreshLiveSnap();
+  }
+
+  /* Rewind in live mode: restart the engine and fast-forward without drawing.
+   * The work is pure wasm, so even a million elements lands in a few hundred
+   * milliseconds. */
+  function seekLive(target) {
+    const live = eng.live;
+    target = Math.max(0, Math.min(live.est, target | 0));
+    const wasQuiet = eng.quiet;
+    eng.quiet = true;
+    loadIntoWasm(eng.base);
+    live.evDone = 0;
+    live.done = false;
+    live.batchMs = 0;
+    const t0 = performance.now();
+    while (!wasm.is_done() && wasm.events_total() < target && performance.now() - t0 < 350) {
+      wasm.eng_batch(BATCH_EVENTS);
+    }
+    live.batchMs += performance.now() - t0;
+    eng.ms = live.batchMs;
+    live.evDone = wasm.events_total();
+    eng.i = live.evDone;
+    eng.total = Math.max(live.est, live.evDone);
+    eng.cmp = wasm.cmp_total();
+    eng.swaps = wasm.swap_total();
+    if (wasm.is_done()) {
+      live.done = true;
+      eng.sortedOk = wasmSorted(eng.base.length);
+      eng.total = live.evDone;
+    }
+    refreshLiveSnap();
+    ui.scrub.value = String(live.evDone);
+    if (!wasm.is_done()) document.body.dataset.sorted = "0";
+    eng.quiet = wasQuiet;
   }
 
   /* ---------- array patterns ---------- */
@@ -425,13 +568,16 @@
   function resetPlayback() {
     eng.maxV = 1;
     for (let i = 0; i < eng.base.length; i++) if (eng.base[i] > eng.maxV) eng.maxV = eng.base[i];
-    if (eng.mode === "lapse") {
-      eng.lapse.f = 0;
+    if (eng.mode === "live") {
       eng.i = 0;
-      eng.total = eng.lapse.frames;
-      eng.last = `time-lapse · ${eng.lapse.frames} frames over n=${eng.base.length}`;
-      ui.scrub.max = String(Math.max(1, eng.lapse.frames - 1));
+      eng.last = `streaming · ${eng.base.length.toLocaleString()} elements`;
+      ui.scrub.max = String(Math.max(1, eng.live.est));
       ui.scrub.value = "0";
+      loadIntoWasm(eng.base);
+      eng.live.evDone = 0;
+      eng.live.done = false;
+      eng.live.batchMs = 0;
+      refreshLiveSnap();
       return;
     }
     eng.vals = Int32Array.from(eng.base);
@@ -457,11 +603,10 @@
 
   function applyStep() {
     if (eng.i >= eng.total) return false;
-    const k = eng.i * 2;
-    const op = eng.trace[k];
-    const slot = eng.trace[k + 1];
-    const x = slot & 0xffff;
-    const y = slot >>> 16;
+    const k = eng.i * 3;
+    const op = eng.events[k];
+    const x = eng.events[k + 1];
+    const y = eng.events[k + 2];
     const vals = eng.vals;
 
     switch (op) {
@@ -526,7 +671,7 @@
         for (let i = 0; i < eng.heat.length; i++) eng.heat[i] += 0.5;
         eng.active = [-1, -1]; eng.lanes = []; eng.pivot = -1;
         if (!eng.quiet) audio.done();
-        eng.last = `done — ${eng.total} records`;
+        eng.last = `done — ${eng.total.toLocaleString()} interactions`;
         break;
     }
     eng.i++;
@@ -534,10 +679,8 @@
   }
 
   function seek(target) {
-    if (eng.mode === "lapse") {
-      eng.lapse.f = Math.max(0, Math.min(eng.lapse.frames - 1, target | 0));
-      eng.i = Math.floor(eng.lapse.f);
-      ui.scrub.value = String(eng.lapse.f);
+    if (eng.mode === "live") {
+      seekLive(target);
       return;
     }
     target = Math.max(0, Math.min(eng.total, target | 0));
@@ -564,37 +707,48 @@
     ui.size.value = String(sliderFromSize(n));
 
     eng.base = makeArray(pattern, n);
+
     const t0 = performance.now();
-    let out = n <= TRACE_MAX_N ? sortInWasm(eng.base) : null;
-    const expect = out ? Int32Array.from(eng.base).sort() : null;
+    const events = n <= TRACE_MAX_N ? collectEvents(eng.base) : null;
 
-    if (out && out.overflow === 0) {
+    if (events) {
       eng.mode = "trace";
-      eng.trace = out.trace;
-      eng.total = out.trace.length / 2;
-      eng.cmp = out.cmp;
-      eng.swaps = out.swaps;
-      let ok = true;
-      for (let i = 0; i < n; i++) if (out.sorted[i] !== expect[i]) { ok = false; break; }
-      eng.sortedOk = ok;
-    } else {
-      eng.mode = "lapse";
-      const lap = sortLapseInWasm(eng.base);
-      eng.lapse = lap;
-      eng.cmp = lap.cmp;
-      eng.swaps = lap.swaps;
-      eng.total = lap.frames;
-      eng.sortedOk = sortedView(lap.sorted, n);
-    }
-    eng.ms = performance.now() - t0;
-    document.body.dataset.sorted = eng.sortedOk ? "1" : "0";
-    if (!eng.sortedOk) console.error("wasm sort mismatch — visualization would be wrong");
+      eng.events = events;
+      eng.total = events.length / 3;
+      eng.cmp = wasm.cmp_total();
+      eng.swaps = wasm.swap_total();
+      eng.ms = performance.now() - t0;
 
-    ui.legend.style.display = eng.mode === "lapse" ? "none" : "";
-    ui.modeNote.textContent =
-      eng.mode === "lapse"
-        ? `time-lapse: ${eng.lapse.frames} sampled frames — n is above ${TRACE_MAX_N.toLocaleString()}`
-        : "per-step trace: every compare and swap";
+      const expect = Int32Array.from(eng.base).sort();
+      const got = memView(Int32Array, wasm.arr_ptr(), Math.max(n, 1));
+      let ok = true;
+      for (let i = 0; i < n; i++) if (got[i] !== expect[i]) { ok = false; break; }
+      eng.sortedOk = ok;
+      document.body.dataset.sorted = ok ? "1" : "0";
+      if (!ok) console.error("wasm sort mismatch — visualization would be wrong");
+
+      ui.modeNote.textContent = `per-step: all ${eng.total.toLocaleString()} interactions stored`;
+      ui.legend.style.display = "";
+    } else {
+      eng.mode = "live";
+      startLive(eng.base);
+      eng.cmp = 0;
+      eng.swaps = 0;
+      eng.ms = 0;
+      eng.sortedOk = true;
+      eng.total = eng.live.est;
+      document.body.dataset.sorted = "0";
+
+      ui.modeNote.textContent =
+        `streaming: every interaction runs live; n is above ${TRACE_MAX_N.toLocaleString()}`;
+      ui.legend.style.display = "none";
+    }
+
+    if (eng.mode === "live") {
+      // Aim for roughly twenty seconds of playback; the slider still overrides.
+      const want = eng.live.est / 20;
+      ui.speed.value = String(Math.max(0, Math.min(100, Math.round((Math.log10(want) - 3) * 25))));
+    }
 
     resetPlayback();
     eng.playing = true;
@@ -632,7 +786,7 @@
   }
 
   function draw() {
-    if (eng.mode === "lapse") return drawLapse();
+    if (eng.mode === "live") return drawLive();
     const W = canvas.width, H = canvas.height;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, W, H);
@@ -766,34 +920,31 @@
   }
 
   /*
-   * Time-lapse rendering: bars come from two sampled snapshots, interpolated,
-   * so the array morphs smoothly instead of stepping through frames.
+   * Live rendering: the engine holds the real array, so each frame asks wasm
+   * for SNAP_BUCKETS strided samples of its current state. No interpolation,
+   * no stored frames — what you see is the array right now.
    */
-  function drawLapse() {
+  function drawLive() {
     const W = canvas.width, H = canvas.height;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, W, H);
-    const lap = eng.lapse;
-    if (!lap || !lap.frames) return;
+    const live = eng.live;
+    if (!live) return;
 
     const padT = 26 * dpr, padB = 20 * dpr, padX = 6 * dpr;
     const plotW = W - padX * 2;
     const plotH = H - padT - padB;
-    const { frames, buckets, data } = lap;
+    const buckets = live.buckets;
     const bw = plotW / buckets;
-    const f0 = Math.max(0, Math.min(frames - 1, Math.floor(lap.f)));
-    const f1 = Math.min(frames - 1, f0 + 1);
-    const t = Math.max(0, Math.min(1, lap.f - f0));
     const maxV = Math.max(1, eng.maxV);
-    const row0 = f0 * buckets, row1 = f1 * buckets;
     const dense = bw < 2 * dpr;
 
     for (let b = 0; b < buckets; b++) {
-      const v = data[row0 + b] + (data[row1 + b] - data[row0 + b]) * t;
+      const v = live.snap[b];
       const h = Math.max(1, (v / maxV) * plotH);
       const x = padX + b * bw;
       const y = padT + plotH - h;
-      const c = mix([66, 106, 224], [52, 196, 136], v / maxV);
+      const c = mix([66, 106, 224], [52, 196, 136], Math.max(0, Math.min(1, v / maxV)));
       ctx.fillStyle = `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},0.95)`;
       if (dense) {
         ctx.fillRect(Math.round(x), Math.round(y), 1, Math.ceil(h));
@@ -828,17 +979,18 @@
 
   function updateSpeedLabel() {
     const rate = speedOf(parseInt(ui.speed.value, 10));
-    ui.speedVal.textContent =
-      eng.mode === "lapse"
-        ? Math.round(Math.max(2, Math.min(160, rate / 12))) + " fps"
-        : Math.round(rate).toLocaleString() + "/s";
+    ui.speedVal.textContent = Math.round(rate).toLocaleString() + "/s";
   }
 
   function syncStats() {
     const n = eng.base ? eng.base.length : 0;
     const logn = n > 1 ? Math.log2(n) : 1;
     ui.sN.textContent = String(n);
-    ui.sStep.textContent = `${eng.i.toLocaleString()} / ${eng.total.toLocaleString()}`;
+    const compact = (v) => (v >= 1e6 ? (v / 1e6).toFixed(2) + "M" : v >= 1e4 ? (v / 1e3).toFixed(1) + "k" : String(v));
+    ui.sStep.textContent =
+      eng.mode === "live"
+        ? `${compact(eng.i)} / ${compact(eng.total)}`
+        : `${eng.i.toLocaleString()} / ${eng.total.toLocaleString()}`;
     ui.sCmp.textContent = eng.cmp.toLocaleString();
     ui.sSwap.textContent = eng.swaps.toLocaleString();
     ui.sRatio.textContent = n > 8 ? (eng.cmp / (n * logn)).toFixed(2) + "×" : "–";
@@ -854,21 +1006,16 @@
 
     if (eng.playing) {
       const rate = speedOf(parseInt(ui.speed.value, 10));
-      if (eng.mode === "lapse") {
-        const lap = eng.lapse;
-        const fps = Math.max(2, Math.min(160, rate / 12));
-        const before = Math.floor(lap.f);
-        lap.f = Math.min(lap.frames - 1, lap.f + (fps * dt) / 1000);
-        eng.i = Math.floor(lap.f);
-        if (eng.i !== before && !eng.quiet) {
-          const mid = lap.buckets >> 1;
-          audio.tick(lap.data[eng.i * lap.buckets + mid], eng.maxV);
-        }
-        if (lap.f >= lap.frames - 1) {
+      if (eng.mode === "live") {
+        const budget = Math.max(8, Math.min(BATCH_EVENTS, Math.round((rate * dt) / 1000)));
+        stepLive(budget);
+        eng.i = eng.live.evDone;
+        eng.total = eng.live.done ? eng.live.evDone : Math.max(eng.live.est, eng.live.evDone);
+        ui.scrub.value = String(eng.live.evDone);
+        if (eng.live.done) {
           eng.playing = false;
           ui.play.textContent = "Play";
         }
-        ui.scrub.value = String(eng.i);
       } else {
         eng.acc += (rate * dt) / 1000;
         let budget = Math.floor(eng.acc);
@@ -902,7 +1049,7 @@
     };
 
     ui.play.addEventListener("click", () => {
-      const atEnd = eng.mode === "lapse" ? eng.lapse.f >= eng.lapse.frames - 1 : eng.i >= eng.total;
+      const atEnd = eng.mode === "live" ? eng.live.done : eng.i >= eng.total;
       if (atEnd) seek(0);
       eng.playing = !eng.playing;
       ui.play.textContent = eng.playing ? "Pause" : "Play";
@@ -910,8 +1057,10 @@
     ui.step.addEventListener("click", () => {
       eng.playing = false;
       ui.play.textContent = "Play";
-      if (eng.mode === "lapse") {
-        seek(eng.lapse.f + 1);
+      if (eng.mode === "live") {
+        stepLive(8);
+        eng.i = eng.live.evDone;
+        ui.scrub.value = String(eng.live.evDone);
       } else {
         applyStep();
         ui.scrub.value = String(eng.i);
@@ -934,12 +1083,28 @@
       if (!muted) audio.compare(eng.maxV * 0.6, eng.maxV);
     });
 
+    let scrubTimer = 0;
+    const scrubTo = (target) => {
+      seek(target);
+      syncStats();
+      draw();
+    };
     ui.scrub.addEventListener("input", () => {
       eng.playing = false;
       ui.play.textContent = "Play";
-      seek(parseInt(ui.scrub.value, 10));
-      syncStats();
-      draw();
+      const target = parseInt(ui.scrub.value, 10);
+      if (eng.mode === "live") {
+        // Rewinding means restarting the engine, so debounce while dragging.
+        clearTimeout(scrubTimer);
+        scrubTimer = setTimeout(() => scrubTo(target), 90);
+      } else {
+        scrubTo(target);
+      }
+    });
+    ui.scrub.addEventListener("change", () => {
+      if (eng.mode !== "live") return;
+      clearTimeout(scrubTimer);
+      scrubTo(parseInt(ui.scrub.value, 10));
     });
 
     ui.size.addEventListener("input", () => {

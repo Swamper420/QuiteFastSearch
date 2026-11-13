@@ -1,4 +1,4 @@
-// Correctness + trace-fidelity tests for the compiled Sluice Sort wasm module.
+// Correctness, resumability and fidelity tests for the Sluice Sort wasm engine.
 // Usage: node test/test.mjs [path/to/sluice.wasm]
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -11,51 +11,74 @@ const { instance } = await WebAssembly.instantiate(readFileSync(wasmPath), {});
 const ex = instance.exports;
 const memory = ex.memory;
 
-function run(values) {
+const OP = {
+  CMP: 0, SWAP: 1, PIVOT: 2, RANGE: 3, LANE: 4, ORD: 5,
+  REV: 6, INS: 7, DONE: 8, CMPV: 9, SET: 10, LANE2: 11,
+};
+const KNOWN_OPS = new Set(Object.values(OP));
+const MAX_EVENT_U32 = 3;
+
+/*
+ * Drive the resumable engine. With collect=false the interaction log is read
+ * but discarded (large arrays); the sort itself is unaffected.
+ */
+function runAll(values, { collect = true, batch = 30000 } = {}) {
   const n = values.length;
-  const arr = new Int32Array(memory.buffer, ex.arr_ptr(), Math.max(n, 1));
-  arr.set(values);
-  ex.ssort(n);
-  const sorted = Array.from(new Int32Array(memory.buffer, ex.arr_ptr(), n));
+  new Int32Array(memory.buffer, ex.arr_ptr(), Math.max(n, 1)).set(values);
+  ex.begin_sort(n);
 
-  const len = ex.trace_len();
-  const raw = new Uint32Array(memory.buffer, ex.trace_ptr(), len * 2);
-  const trace = new Uint32Array(raw); // copy before further calls clobber it
+  let buf = collect ? new Uint32Array(1 << 14) : null;
+  let len = 0;
+  let steps = 0;
 
+  for (;;) {
+    const count = ex.eng_batch(batch);
+    steps++;
+    if (count > 0 && collect) {
+      const need = len + count * MAX_EVENT_U32;
+      if (need > buf.length) {
+        const grow = new Uint32Array(Math.max(buf.length * 2, need));
+        grow.set(buf.subarray(0, len));
+        buf = grow;
+      }
+      buf.set(new Uint32Array(memory.buffer, ex.evbuf_ptr(), count * MAX_EVENT_U32), len);
+      len = need;
+    }
+    if (ex.is_done()) break;
+    if (count === 0) throw new Error(`engine stalled after ${steps} batches`);
+    if (steps > 100000) throw new Error("runaway engine");
+  }
+
+  const sorted = new Int32Array(memory.buffer, ex.arr_ptr(), n);
   return {
     sorted,
-    trace,
+    events: collect ? buf.subarray(0, len) : null,
     cmp: ex.cmp_total(),
     swaps: ex.swap_total(),
-    steps: len,
+    dropped: ex.events_dropped(),
+    totalEvents: ex.events_total(),
+    batches: steps,
   };
 }
 
-const OP = { CMP: 0, SWAP: 1, PIVOT: 2, RANGE: 3, LANE: 4, ORD: 5, REV: 6, INS: 7, DONE: 8, CMPV: 9, SET: 10, LANE2: 11 };
-
-// Replay only the swap records; the result must equal the sorted array.
-function replay(values, trace) {
+// Replay only swap records; the sequence must reproduce the sorted array.
+function replaySwaps(values, events) {
   const mirror = Int32Array.from(values);
-  const ops = new Set([OP.CMP, OP.SWAP, OP.PIVOT, OP.RANGE, OP.LANE, OP.ORD, OP.REV, OP.INS, OP.DONE, OP.CMPV, OP.SET, OP.LANE2]);
-  let sawDone = false;
-  for (let k = 0; k < trace.length; k += 2) {
-    const op = trace[k];
-    const i = trace[k + 1] & 0xffff;
-    const j = trace[k + 1] >>> 16;
-    if (!ops.has(op)) throw new Error(`unknown trace op ${op}`);
+  for (let k = 0; k < events.length; k += MAX_EVENT_U32) {
+    const op = events[k];
+    const i = events[k + 1];
+    const j = events[k + 2];
+    if (!KNOWN_OPS.has(op)) throw new Error(`unknown op ${op}`);
     if (op === OP.SWAP) {
+      if (i >= mirror.length || j >= mirror.length) throw new Error(`swap out of range: ${i},${j}`);
       const t = mirror[i];
       mirror[i] = mirror[j];
       mirror[j] = t;
-    } else if (op === OP.CMP || op === OP.SWAP || op === OP.PIVOT) {
-      if (i >= mirror.length || (op === OP.CMP && j >= mirror.length)) {
-        throw new Error(`op ${op} index out of range: ${i},${j}`);
-      }
-    } else if (op === OP.DONE) {
-      sawDone = true;
+    }
+    if (op === OP.CMP && (i >= mirror.length || j >= mirror.length)) {
+      throw new Error(`compare out of range: ${i},${j}`);
     }
   }
-  if (!sawDone) throw new Error("missing DONE record");
   return mirror;
 }
 
@@ -64,140 +87,148 @@ let checks = 0;
 let worstRatio = 0;
 let worstCase = "";
 
-function check(name, values) {
-  checks++;
-  const expected = [...values].sort((x, y) => x - y);
-  const { sorted, trace, cmp, swaps, steps } = run(values);
-  const got = Array.from(sorted);
+function sameArray(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
 
-  const same = got.length === expected.length && got.every((v, i) => v === expected[i]);
-  if (!same) {
+function check(name, values, { eventBudget = 0 } = {}) {
+  checks++;
+  const expected = Int32Array.from(values).sort();
+  const r = runAll(values);
+  const got = Array.from(r.sorted);
+
+  if (!sameArray(got, Array.from(expected))) {
     failures++;
-    console.error(`FAIL sort  ${name}: expected ${expected.slice(0, 16)}... got ${got.slice(0, 16)}...`);
+    console.error(`FAIL sort  ${name}: expected ${expected.slice(0, 12)}... got ${got.slice(0, 12)}...`);
     return;
   }
-
-  const played = Array.from(replay(values, trace));
-  const fidelity = played.every((v, i) => v === expected[i]);
-  if (!fidelity) {
+  if (r.dropped !== 0) {
+    failures++;
+    console.error(`FAIL drops ${name}: ${r.dropped} interactions lost`);
+    return;
+  }
+  if (!sameArray(Array.from(replaySwaps(values, r.events)), Array.from(expected))) {
     failures++;
     console.error(`FAIL trace ${name}: replay diverged`);
     return;
   }
 
-  // Sanity bound: sampling quicksort should stay far below n^2.
   const n = values.length;
   const bound = 12 * n * Math.max(1, Math.log2(Math.max(n, 2))) + 256;
-  if (cmp > bound) {
+  if (r.cmp > bound) {
     failures++;
-    console.error(`FAIL budget ${name}: ${cmp} comparisons, bound ${bound.toFixed(0)}`);
+    console.error(`FAIL budget ${name}: ${r.cmp} comparisons, bound ${bound.toFixed(0)}`);
     return;
   }
-
+  if (eventBudget && r.events.length / 3 > eventBudget) {
+    failures++;
+    console.error(`FAIL events ${name}: ${r.events.length / 3} > ${eventBudget}`);
+  }
   if (n > 16) {
-    const ratio = cmp / (n * Math.log2(n));
+    const ratio = r.cmp / (n * Math.log2(n));
     if (ratio > worstRatio) {
       worstRatio = ratio;
-      worstCase = `${name} (n=${n}, ${cmp} compares, ${swaps} swaps, ${steps} records)`;
+      worstCase = `${name} (n=${n}, ${r.cmp} compares, ${r.totalEvents} interactions)`;
     }
+  }
+}
+
+// Large arrays: no event log, but the array must still be sorted and the
+// snapshot must sample the live array from end to end.
+function checkBig(name, values) {
+  checks++;
+  const n = values.length;
+  const expected = Int32Array.from(values).sort();
+  const r = runAll(values, { collect: false });
+
+  if (!sameArray(Array.from(r.sorted), Array.from(expected))) {
+    failures++;
+    console.error(`FAIL big sort ${name}`);
+    return;
+  }
+  if (r.dropped !== 0) {
+    failures++;
+    console.error(`FAIL big drops ${name}: ${r.dropped}`);
+  }
+  const buckets = ex.snapshot(512);
+  const samples = new Int32Array(memory.buffer, ex.snap_ptr(), buckets);
+  checks++;
+  if (buckets !== 512 || samples[0] !== expected[0] || samples[511] !== expected[n - 1]) {
+    failures++;
+    console.error(`FAIL snapshot endpoints ${name}: ${samples[0]}..${samples[511]}`);
+  }
+  const bound = 12 * n * Math.max(1, Math.log2(Math.max(n, 2))) + 256;
+  if (r.cmp > bound) {
+    failures++;
+    console.error(`FAIL big budget ${name}: ${r.cmp}`);
   }
 }
 
 function shuffle(n, seed) {
-  const v = Array.from({ length: n }, (_, i) => i + 1);
+  const v = new Int32Array(n);
+  for (let i = 0; i < n; i++) v[i] = i + 1;
   let s = seed >>> 0;
   const rnd = () => ((s = (s * 1664525 + 1013904223) >>> 0) / 2 ** 32);
   for (let i = n - 1; i > 0; i--) {
     const j = Math.floor(rnd() * (i + 1));
-    [v[i], v[j]] = [v[j], v[i]];
+    const t = v[i]; v[i] = v[j]; v[j] = t;
   }
   return v;
-}
-
-// Time-lapse path: no per-operation trace, fixed-size sampled snapshots.
-function runLapse(values, frames = 256, buckets = 512) {
-  const n = values.length;
-  new Int32Array(memory.buffer, ex.arr_ptr(), n).set(values);
-  const got = ex.ssort_lapse(n, frames, buckets);
-  const bk = ex.snap_bucket_count();
-  const snap = new Int32Array(new Int32Array(memory.buffer, ex.snap_ptr(), got * bk));
-  const sorted = new Int32Array(memory.buffer, ex.arr_ptr(), n);
-  return { frames: got, buckets: bk, snap, sorted, cmp: ex.cmp_total(), swaps: ex.swap_total() };
-}
-
-function checkLapse(name, values) {
-  checks++;
-  const n = values.length;
-  const r = runLapse(values);
-  const expected = Int32Array.from(values).sort();
-
-  for (let i = 0; i < n; i++) {
-    if (r.sorted[i] !== expected[i]) {
-      failures++;
-      console.error(`FAIL lapse sort ${name}: wrong element at ${i}`);
-      return;
-    }
-  }
-  if (r.frames < 2 || r.frames > 256 || r.buckets !== 512) {
-    failures++;
-    console.error(`FAIL lapse shape ${name}: ${r.frames} frames x ${r.buckets}`);
-    return;
-  }
-
-  const first = values[0], last = expected[n - 1];
-  if (r.snap[0] !== first || r.snap[r.snap.length - 1] !== last) {
-    failures++;
-    console.error(`FAIL lapse endpoints ${name}: ${r.snap[0]}..${r.snap[r.snap.length - 1]}`);
-    return;
-  }
-
-  const bound = 12 * n * Math.max(1, Math.log2(Math.max(n, 2))) + 256;
-  if (r.cmp > bound) {
-    failures++;
-    console.error(`FAIL lapse budget ${name}: ${r.cmp} > ${bound.toFixed(0)}`);
-  }
 }
 
 const sizes = [0, 1, 2, 3, 4, 5, 7, 8, 16, 17, 23, 24, 25, 33, 40, 41, 100, 257, 512, 1024, 2048, 8192];
 
 for (const n of sizes) {
   check(`random n=${n}`, shuffle(n, 12345 + n));
-  check(`sorted n=${n}`, Array.from({ length: n }, (_, i) => i + 1));
-  check(`reversed n=${n}`, Array.from({ length: n }, (_, i) => n - i));
-  check(`equal n=${n}`, new Array(n).fill(7));
-  check(`two-values n=${n}`, Array.from({ length: n }, (_, i) => (i % 3 === 0 ? 1 : 2)));
-  check(`organ-pipe n=${n}`, Array.from({ length: n }, (_, i) => (i < n / 2 ? i + 1 : n - i)));
-  check(`sawtooth n=${n}`, Array.from({ length: n }, (_, i) => (i % 7) + 1));
-  check(`negatives n=${n}`, Array.from({ length: n }, (_, i) => ((i * 37) % 101) - 50));
+  check(`sorted n=${n}`, Int32Array.from({ length: n }, (_, i) => i + 1));
+  check(`reversed n=${n}`, Int32Array.from({ length: n }, (_, i) => n - i));
+  check(`equal n=${n}`, new Int32Array(n).fill(7));
+  check(`two-values n=${n}`, Int32Array.from({ length: n }, (_, i) => (i % 3 === 0 ? 1 : 2)));
+  check(`organ-pipe n=${n}`, Int32Array.from({ length: n }, (_, i) => (i < n / 2 ? i + 1 : n - i)));
+  check(`sawtooth n=${n}`, Int32Array.from({ length: n }, (_, i) => (i % 7) + 1));
+  check(`negatives n=${n}`, Int32Array.from({ length: n }, (_, i) => ((i * 37) % 101) - 50));
 }
 
-// Nearly sorted: 1% of elements displaced.
 for (const n of [64, 300, 1000]) {
-  const v = Array.from({ length: n }, (_, i) => i + 1);
+  const v = Int32Array.from({ length: n }, (_, i) => i + 1);
   for (let k = 0; k < Math.max(1, n / 100); k++) {
     const i = Math.floor((k * 7919) % n);
     const j = Math.min(n - 1, i + 1 + (k % 5));
-    [v[i], v[j]] = [v[j], v[i]];
+    const t = v[i]; v[i] = v[j]; v[j] = t;
   }
   check(`nearly-sorted n=${n}`, v);
 }
 
-// Determinism: identical input must produce an identical trace.
+// Determinism: identical input must produce an identical interaction stream.
 {
   const v = shuffle(500, 99);
-  const a = run(v);
-  const b = run(v);
+  const a = runAll(v);
+  const b = runAll(v);
   checks++;
-  if (a.trace.length !== b.trace.length || a.trace.some((x, i) => x !== b.trace[i])) {
+  if (a.events.length !== b.events.length || !sameArray(Array.from(a.events), Array.from(b.events))) {
     failures++;
     console.error("FAIL determinism");
   }
 }
 
+// Resumability: consuming the run in tiny batches must not change anything.
+{
+  const v = shuffle(700, 7);
+  const once = runAll(v, { batch: 100000 });
+  const many = runAll(v, { batch: 9 });
+  checks++;
+  if (!sameArray(Array.from(once.events), Array.from(many.events))) {
+    failures++;
+    console.error(`FAIL resumability: ${once.events.length} vs ${many.events.length} events`);
+  }
+}
+
 // Monotone inputs must be linear: n+1 compares or fewer.
 for (const n of [256, 1024, 2048]) {
-  const asc = run(Array.from({ length: n }, (_, i) => i + 1));
-  const desc = run(Array.from({ length: n }, (_, i) => n - i));
+  const asc = runAll(Int32Array.from({ length: n }, (_, i) => i + 1), { collect: false });
+  const desc = runAll(Int32Array.from({ length: n }, (_, i) => n - i), { collect: false });
   checks++;
   if (asc.cmp > n + 2 || desc.cmp > n + 2) {
     failures++;
@@ -205,10 +236,10 @@ for (const n of [256, 1024, 2048]) {
   }
 }
 
-// Duplicate-heavy input must stay near linear-ish, not quadratic.
+// Duplicate-heavy input must stay near n log n.
 for (const n of [1024, 2048]) {
-  const v = Array.from({ length: n }, (_, i) => (i * 2654435761) % 5);
-  const r = run(v);
+  const v = Int32Array.from({ length: n }, (_, i) => (i * 2654435761) % 5);
+  const r = runAll(v, { collect: false });
   checks++;
   if (r.cmp > 6 * n * Math.log2(n)) {
     failures++;
@@ -216,33 +247,27 @@ for (const n of [1024, 2048]) {
   }
 }
 
-// Per-step tracing must not overflow its record budget at the largest
-// size the viewer still animates step by step.
-for (const n of [4096, 8192]) {
-  run(shuffle(n, 4242 + n));
+// Large-array path: every interaction still runs, nothing is sampled away.
+for (const n of [8193, 32768, 65536, 262144]) {
+  checkBig(`big random n=${n}`, shuffle(n, 77 + n));
+  checkBig(`big reversed n=${n}`, Int32Array.from({ length: n }, (_, i) => n - i));
+}
+checkBig("big random 1M", shuffle(1 << 20, 31337));
+checkBig("big sorted 1M", Int32Array.from({ length: 1 << 20 }, (_, i) => i + 1));
+
+// Interaction counts scale as expected; guard against an accidental O(n^2) log.
+{
+  const n = 1 << 20;
+  const r = runAll(shuffle(n, 4242), { collect: false });
   checks++;
-  if (ex.trace_over() !== 0) {
+  const perElement = r.totalEvents / (n * Math.log2(n));
+  if (perElement > 8) {
     failures++;
-    console.error(`FAIL trace overflow at n=${n}: ${ex.trace_over()} dropped`);
+    console.error(`FAIL event volume at 1M: ${r.totalEvents} interactions (${perElement.toFixed(2)} per n log n)`);
   }
-  checks++;
-  if (ex.trace_len() > ex.trace_cap()) {
-    failures++;
-    console.error(`FAIL trace over capacity at n=${n}`);
-  }
+  console.log(`1M interactions: ${r.totalEvents.toLocaleString()} (${perElement.toFixed(2)} per n log2 n)`);
 }
 
-// Time-lapse path, including the 1M ceiling.
-for (const n of [8193, 65536, 262144]) {
-  checkLapse(`lapse random n=${n}`, shuffle(n, 77 + n));
-  checkLapse(`lapse reversed n=${n}`, Array.from({ length: n }, (_, i) => n - i));
-  checkLapse(`lapse dupes n=${n}`, Array.from({ length: n }, (_, i) => ((i * 2654435761) >>> 0) % 7));
-}
-checkLapse("lapse sorted 1M", Int32Array.from({ length: 1 << 20 }, (_, i) => i + 1));
-checkLapse("lapse reversed 1M", Int32Array.from({ length: 1 << 20 }, (_, i) => (1 << 20) - i));
-checkLapse("lapse random 1M", shuffle(1 << 20, 31337));
-
-// wasm memory must stay at its declared size, no growth during big sorts.
 checks++;
 if (memory.buffer.byteLength !== 64 * 1024 * 1024) {
   failures++;

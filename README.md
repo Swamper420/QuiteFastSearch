@@ -5,7 +5,7 @@ browser visualizer. The whole demo — algorithm, UI, and the compiled wasm
 module — is one HTML file with no network requests and no dependencies.
 
 ```
-dist/sluice-sort.html     ← open this; 49 KiB, works offline
+dist/sluice-sort.html     ← open this; 51 KiB, works offline
 ```
 
 ## What the algorithm does
@@ -37,15 +37,19 @@ novelty.
 | few distinct keys | `O(n log k)` | equal lane is final |
 | worst | `O(n²)` | adversarial pivot sampling |
 
-Auxiliary space: `O(log n)` stack, zero heap allocation. All comparisons and
-moves are appended to a trace log (8 bytes per record), so a host can replay
-and animate the sort deterministically instead of re-running it.
+Auxiliary space: `O(log n)` stack, zero heap allocation.
+
+The implementation is a **resumable state machine**, not a loop. Each call to
+`eng_batch(k)` advances the sort by at most `k` interactions and leaves the
+continuation on an explicit frame stack inside wasm. Every comparison, swap,
+gate and settle step is therefore observable by the host as it happens — no
+event buffer sized `O(n log n)`, no skipped work, no restart to resume.
 
 ## Why WebAssembly in one file
 
 The wasm module has **zero imports**: no libc, no allocator, no JavaScript glue.
-It exports `ssort(n)` plus a few accessors and owns its memory. The page needs
-only `WebAssembly.instantiate(bytes)`.
+It exports `begin_sort(n)` / `eng_batch(k)` / `snapshot(buckets)` plus accessors,
+and owns its memory. The page needs only `WebAssembly.instantiate(bytes)`.
 
 The module is embedded as base64 inside a `<script>` tag, so the page has no
 `fetch`, no `.wasm` file, no build step at runtime, and works from `file://`:
@@ -76,23 +80,27 @@ No emscripten, no wabt, no npm dependencies.
 node test/test.mjs
 ```
 
-202 checks: sizes 0–1,048,576, random / sorted / reversed / constant / duplicate /
+208 checks: sizes 0–1,048,576, random / sorted / reversed / constant / duplicate /
 organ-pipe / sawtooth / negative inputs, plus:
 
-- **trace fidelity** — replaying only the `SWAP` records from the log must
-  reproduce the sorted array, so the animation cannot drift from the algorithm;
-- **determinism** — same input, byte-identical trace;
+- **replay fidelity** — replaying only the `SWAP` records from the interaction
+  stream must reproduce the sorted array, so the animation cannot drift;
+- **resumability** — running in 9-event batches and in one batch must produce
+  byte-identical streams;
+- **determinism** — same input, identical interaction stream;
+- **no losses** — `events_dropped()` stays 0, including at 1M;
 - **linear monotone** — sorted and reversed inputs use at most `n+1` compares;
 - **budget** — no input exceeds `12 n log₂n + 256` compares.
 
-Latest run: `202/202 checks passed`, worst case `1.14–1.23 n log₂n`.
+Latest run: `208/208 checks passed`, worst case `1.14–1.23 n log₂n`. A million
+shuffled elements produce 64,957,526 interactions (3.10 per `n log₂n`).
 
 ## Using the demo
 
 | control | meaning |
 | --- | --- |
 | size / input | 16 … 1,048,576 on a log slider, a number field, or the 1k/8k/64k/262k/1M presets |
-| speed | steps per second (10 … 100k); frames per second in time-lapse mode |
+| speed | interactions per second (10 … 100k for stored playback, 1k … 10M streaming) |
 | step, restart, new array | manual control; `space`, `s`, `r`, `n` |
 | ♪ sound | synthesized blips on/off; `m` |
 | timeline | scrub anywhere; seeking backwards replays from the start |
@@ -107,19 +115,27 @@ pentatonic scale mapped to element values, so dense playback stays musical
 instead of turning to noise; notes are rate-limited to ~55/s. Browsers keep
 audio suspended until a click or key press, so press anything once.
 
-### Large arrays
+### All the interactions
 
-Per-step tracing costs `O(n log n)` 8-byte records, so it is capped at 8,192
-elements (worst observed: ~300k records of the 1M budget). Above that the wasm
-module switches to **time-lapse** mode: it sorts with tracing off and samples
-512 strided elements into 256 fixed frames (512 KiB total, independent of `n`).
-The viewer interpolates between frames, so a million elements still animate
-smoothly without holding a million-element replay log.
+Nothing is sampled or skipped: the engine always executes every interaction, and
+the viewer always shows the array's real state after each batch. What changes
+above 32,768 elements is only bookkeeping:
 
-Measured in Chromium (headless, this machine): 1,000,000 shuffled elements sort
-in ~280 ms with 22.6M comparisons (1.16× `n log₂n`), verified sorted on readback.
-Memory is fixed: 4 MiB array, 8 MiB trace buffer, 0.5 MiB snapshots, 64 MiB wasm
-memory. Deep links accept any size: `?n=1000000&step=90`.
+| n | playback | rewind | drawing |
+| --- | --- | --- | --- |
+| ≤ 32,768 | interaction stream kept in JS (~18 MiB at the cap) | replay from the start, exact | per element, lane colours, pivot marker |
+| > 32,768 | engine driven live, batches up to 200k interactions/frame | restart + fast-forward in wasm | 512 strided samples of the live array |
+
+The 512-sample cap is a display limit, not an algorithm limit: one million
+elements cannot be drawn as one million bars. At 1M the viewer processes all
+64.9M interactions (22.7M comparisons, 21.4M swaps) and each frame renders the
+exact array state at that moment.
+
+Measured in Chromium (headless, this machine): 1,000,000 shuffled elements take
+~560 ms of engine time and about six seconds of wall clock at maximum playback
+speed, verified sorted on readback. Memory is fixed: 4 MiB array, 3 MiB event
+batch, ~7 KiB continuation frames, 64 MiB wasm memory. Deep links accept any
+size: `?n=1000000&step=9000` is an interaction index in streaming mode.
 
 Colours: blue = `< pivot` lane, teal = `= pivot` lane, slate = still unexamined,
 amber = `> pivot`, green = settled, magenta marker = pivot, warm flash =
@@ -143,7 +159,10 @@ dist/sluice-sort.html generated artifact
   pivot selection.
 - The "novelty" is compositional. If you need a literature claim, benchmark
   against pdqsort/IPS⁴o before making one.
-- Per-step tracing costs memory and writes: ~317k records at the 8,192-element
-  cap, against a 1,048,576-record (8 MiB) budget. If a run ever overflows that
-  budget the viewer falls back to time-lapse automatically. The sorting path
-  itself does not allocate: all buffers are fixed at compile time.
+- Storing the interaction stream is optional and capped: at the 32,768-element
+  cap it is ~1.5M interactions (~18 MiB in JS). If a run needs more, the viewer
+  drops the log and streams instead — the sort is unaffected. The engine itself
+  never allocates: array, batch buffer, frames and samples are fixed at compile
+  time.
+- In streaming mode, drawing samples 512 columns. That is a viewer limit: the
+  engine still touches every element on every interaction.
