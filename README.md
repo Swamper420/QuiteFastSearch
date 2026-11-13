@@ -5,7 +5,7 @@ browser visualizer. The whole demo — algorithm, UI, and the compiled wasm
 module — is one HTML file with no network requests and no dependencies.
 
 ```
-dist/sluice-sort.html     ← open this; 33 KiB, works offline
+dist/sluice-sort.html     ← open this; 49 KiB, works offline
 ```
 
 ## What the algorithm does
@@ -56,7 +56,7 @@ const { instance } = await WebAssembly.instantiate(bytes, {});
 ```
 
 That is the whole integration story. It is not just possible — the compiled
-module is 5.8 KiB, smaller than most icon fonts.
+module is 8.3 KiB, smaller than most icon fonts.
 
 ## Build
 
@@ -76,7 +76,7 @@ No emscripten, no wabt, no npm dependencies.
 node test/test.mjs
 ```
 
-178 checks: sizes 0–2048, random / sorted / reversed / constant / duplicate /
+202 checks: sizes 0–1,048,576, random / sorted / reversed / constant / duplicate /
 organ-pipe / sawtooth / negative inputs, plus:
 
 - **trace fidelity** — replaying only the `SWAP` records from the log must
@@ -85,19 +85,41 @@ organ-pipe / sawtooth / negative inputs, plus:
 - **linear monotone** — sorted and reversed inputs use at most `n+1` compares;
 - **budget** — no input exceeds `12 n log₂n + 256` compares.
 
-Latest run: `178/178 checks passed`, worst case `1.14–1.23 n log₂n`.
+Latest run: `202/202 checks passed`, worst case `1.14–1.23 n log₂n`.
 
 ## Using the demo
 
 | control | meaning |
 | --- | --- |
-| size / input | array length and generator |
-| speed | playback steps per second (10 … 100k) |
+| size / input | 16 … 1,048,576 on a log slider, a number field, or the 1k/8k/64k/262k/1M presets |
+| speed | steps per second (10 … 100k); frames per second in time-lapse mode |
 | step, restart, new array | manual control; `space`, `s`, `r`, `n` |
+| ♪ sound | synthesized blips on/off; `m` |
 | timeline | scrub anywhere; seeking backwards replays from the start |
 
 Deep links: `dist/sluice-sort.html?n=512&pattern=dupes&step=1200` opens paused at
 that step, which is handy for screenshots and bug reports.
+
+Sound is synthesized on the fly with Web Audio — no audio files, so the page stays
+one file. Comparisons tick, swaps bloop downward, pivots chime, settled ranges
+sparkle, and the finished sort plays a short arpeggio. Pitches come from a
+pentatonic scale mapped to element values, so dense playback stays musical
+instead of turning to noise; notes are rate-limited to ~55/s. Browsers keep
+audio suspended until a click or key press, so press anything once.
+
+### Large arrays
+
+Per-step tracing costs `O(n log n)` 8-byte records, so it is capped at 8,192
+elements (worst observed: ~300k records of the 1M budget). Above that the wasm
+module switches to **time-lapse** mode: it sorts with tracing off and samples
+512 strided elements into 256 fixed frames (512 KiB total, independent of `n`).
+The viewer interpolates between frames, so a million elements still animate
+smoothly without holding a million-element replay log.
+
+Measured in Chromium (headless, this machine): 1,000,000 shuffled elements sort
+in ~280 ms with 22.6M comparisons (1.16× `n log₂n`), verified sorted on readback.
+Memory is fixed: 4 MiB array, 8 MiB trace buffer, 0.5 MiB snapshots, 64 MiB wasm
+memory. Deep links accept any size: `?n=1000000&step=90`.
 
 Colours: blue = `< pivot` lane, teal = `= pivot` lane, slate = still unexamined,
 amber = `> pivot`, green = settled, magenta marker = pivot, warm flash =
@@ -121,5 +143,7 @@ dist/sluice-sort.html generated artifact
   pivot selection.
 - The "novelty" is compositional. If you need a literature claim, benchmark
   against pdqsort/IPS⁴o before making one.
-- The trace costs memory and writes: ~5 Ki records for 256 elements, capped at
-  262 144 records (2 MiB). The sorting path itself does not allocate.
+- Per-step tracing costs memory and writes: ~317k records at the 8,192-element
+  cap, against a 1,048,576-record (8 MiB) budget. If a run ever overflows that
+  budget the viewer falls back to time-lapse automatically. The sorting path
+  itself does not allocate: all buffers are fixed at compile time.

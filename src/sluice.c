@@ -23,9 +23,14 @@
  * every sampling quicksort.
  */
 
-#define MAXN 2048
-#define TRACE_RECORDS 262144u
+#define MAXN 1048576            /* 1M elements: 4 MiB of linear memory */
+#define TRACE_RECORDS 1048576u  /* 8 MiB of trace: enough for 8k elements */
 #define CUTOFF 24
+
+/* Time-lapse mode: instead of every operation, sample strided snapshots of
+ * the array while it sorts. Fixed memory, independent of n. */
+#define SNAP_FRAMES 256
+#define SNAP_BUCKETS 512
 
 typedef unsigned int u32;
 
@@ -51,6 +56,14 @@ static u32 trace[TRACE_RECORDS * 2u];
 static u32 tcount;
 static u32 cmp_count;
 static u32 swap_count;
+static u32 dropped;
+
+/* trace / lapse state */
+static int tracing = 1;
+static int snap_on;
+static u32 snap[SNAP_FRAMES * SNAP_BUCKETS];
+static int snap_frames, snap_buckets, snap_done, snap_n;
+static u32 snap_next, snap_stride;
 
 /* Freestanding helpers: clang may lower struct copies to these. */
 void *memcpy(void *d, const void *s, u32 n) {
@@ -66,9 +79,32 @@ void *memset(void *d, int c, u32 n) {
 }
 void *memmove(void *d, const void *s, u32 n) { return memcpy(d, s, n); }
 
+static void snap_store(void) {
+  u32 *dst;
+  int b, n = snap_n, bk = snap_buckets;
+  if (snap_done >= snap_frames) return;
+  dst = &snap[snap_done * SNAP_BUCKETS];
+  if (n <= 0) {
+    for (b = 0; b < bk; b++) dst[b] = 0u;
+    snap_done++;
+    return;
+  }
+  for (b = 0; b < bk; b++) dst[b] = (u32)a[(int)(((long)b * (n - 1)) / (bk - 1))];
+  snap_done++;
+}
+
+static void snap_tick(void) {
+  if (snap_done >= snap_frames) return;
+  if (cmp_count < snap_next) return;
+  snap_store();
+  snap_next = cmp_count + snap_stride;
+}
+
 static void emit(int op, int x, int y) {
   u32 *p;
-  if (tcount >= TRACE_RECORDS) return;
+  if (snap_on) snap_tick();
+  if (!tracing) return;
+  if (tcount >= TRACE_RECORDS) { dropped++; return; }
   p = &trace[tcount * 2u];
   p[0] = (u32)op;
   p[1] = SLOT(x, y);
@@ -208,7 +244,7 @@ static void push_range(int lo, int hi) {
   }
 }
 
-int ssort(int n) {
+static int run_sort(int n) {
   tcount = 0;
   cmp_count = 0;
   swap_count = 0;
@@ -263,11 +299,60 @@ int ssort(int n) {
   return (int)cmp_count;
 }
 
+/* ---- public entry points ---------------------------------------------- */
+
+int ssort(int n) {
+  tracing = 1;
+  snap_on = 0;
+  dropped = 0;
+  return run_sort(n);
+}
+
+/*
+ * Time-lapse mode for large arrays: sort without recording every operation,
+ * but sample `buckets` strided elements into a fixed-size ring of `frames`.
+ * Returns the number of frames actually stored; snapshot memory is
+ * SNAP_FRAMES * SNAP_BUCKETS u32 regardless of n.
+ */
+int ssort_lapse(int n, int frames, int buckets) {
+  u32 lg = 1, est;
+  tracing = 0;
+  snap_on = 0;
+  dropped = 0;
+  if (n < 0) n = 0;
+  if (n > MAXN) n = MAXN;
+  if (frames < 2) frames = 2;
+  if (frames > SNAP_FRAMES) frames = SNAP_FRAMES;
+  if (buckets < 8) buckets = 8;
+  if (buckets > SNAP_BUCKETS) buckets = SNAP_BUCKETS;
+  snap_n = n;
+  snap_frames = frames;
+  snap_buckets = buckets;
+  snap_done = 0;
+  while ((1u << lg) < (u32)n) lg++;
+  est = (u32)n * lg; /* ~ comparisons, used only to space the frames */
+  if (est == 0) est = 1;
+  snap_stride = est / (u32)frames;
+  if (snap_stride == 0) snap_stride = 1;
+  snap_next = snap_stride;
+  snap_on = 1;
+  snap_store(); /* frame 0: untouched input */
+  run_sort(n);
+  snap_store(); /* closing frame: finished array */
+  snap_on = 0;
+  return snap_done;
+}
+
 /* Host API -------------------------------------------------------------- */
 
 int arr_ptr(void)   { return (int)(long)&a[0]; }
 int trace_ptr(void) { return (int)(long)&trace[0]; }
 int trace_len(void) { return (int)tcount; }
+int trace_cap(void) { return (int)TRACE_RECORDS; }
+int trace_over(void){ return (int)dropped; }
 int cmp_total(void) { return (int)cmp_count; }
 int swap_total(void){ return (int)swap_count; }
+int snap_ptr(void)  { return (int)(long)&snap[0]; }
+int snap_count(void){ return snap_done; }
+int snap_bucket_count(void) { return snap_buckets; }
 int max_n(void)     { return MAXN; }

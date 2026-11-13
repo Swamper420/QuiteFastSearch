@@ -29,9 +29,11 @@ clang --target=wasm32 -O2 -std=c99 -nostdlib -ffreestanding -fno-builtin \
   -c "$ROOT/src/sluice.c" -o "$BUILD/sluice.o"
 
 "$LLD" -flavor wasm --no-entry --strip-all \
-  --export-memory --initial-memory=16777216 --max-memory=134217728 \
-  --export=ssort --export=arr_ptr --export=trace_ptr --export=trace_len \
-  --export=cmp_total --export=swap_total --export=max_n \
+  --export-memory --initial-memory=67108864 --max-memory=268435456 \
+  --export=ssort --export=ssort_lapse \
+  --export=arr_ptr --export=trace_ptr --export=trace_len --export=trace_cap \
+  --export=trace_over --export=cmp_total --export=swap_total \
+  --export=snap_ptr --export=snap_count --export=snap_bucket_count --export=max_n \
   -o "$BUILD/sluice.wasm" "$BUILD/sluice.o"
 
 printf 'built %s (%s bytes)\n' "$BUILD/sluice.wasm" "$(stat -c%s "$BUILD/sluice.wasm")"

@@ -92,6 +92,14 @@
   .row label { font-size: 12px; color: var(--dim); min-width: 62px; }
   .row .val { font-family: var(--mono); font-size: 11.5px; color: var(--ink); min-width: 42px; text-align: right; }
   .row input[type="range"] { flex: 1; }
+  .num {
+    width: 78px; text-align: right; font-family: var(--mono); font-size: 11.5px;
+    padding: 3px 6px; border-radius: 7px;
+  }
+  .num { appearance: textfield; -moz-appearance: textfield; }
+  .num::-webkit-outer-spin-button, .num::-webkit-inner-spin-button { display: none; }
+  .chips { display: flex; gap: 5px; flex-wrap: wrap; }
+  .chipbtn { padding: 3px 8px; font-size: 11px; border-radius: 7px; }
   .legend { display: flex; flex-wrap: wrap; gap: 6px 12px; }
   .chip { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--dim); }
   .dot { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
@@ -126,8 +134,9 @@
       <button id="stepBtn">Step</button>
       <button id="resetBtn">Restart</button>
       <button id="shuffleBtn">New array</button>
+      <button id="sound" aria-pressed="true" title="Toggle sound (m)">♪ on</button>
       <span class="spacer"></span>
-      <span class="legend">
+      <span class="legend" id="legend">
         <span class="chip"><span class="dot" style="background:#ffc45c"></span>compare</span>
         <span class="chip"><span class="dot" style="background:#ff7a66"></span>swap</span>
         <span class="chip"><span class="dot" style="background:#d47aff"></span>pivot</span>
@@ -156,9 +165,20 @@
       <h2>Controls</h2>
       <div class="row">
         <label for="size">size</label>
-        <input id="size" type="range" min="16" max="1024" step="1" value="192" />
-        <span class="val" id="sizeVal">192</span>
+        <input id="size" type="range" min="0" max="100" step="1" value="22" />
+        <input id="sizeNum" class="num" type="number" min="16" max="1048576" step="1" value="192" aria-label="Array size" />
       </div>
+      <div class="row">
+        <label></label>
+        <div class="chips">
+          <button class="chipbtn" data-n="1000">1k</button>
+          <button class="chipbtn" data-n="8192">8k</button>
+          <button class="chipbtn" data-n="65536">64k</button>
+          <button class="chipbtn" data-n="262144">262k</button>
+          <button class="chipbtn" data-n="1048576">1M</button>
+        </div>
+      </div>
+      <p class="fine" id="modeNote">per-step trace</p>
       <div class="row">
         <label for="pattern">input</label>
         <select id="pattern" style="flex:1">
@@ -176,7 +196,7 @@
         <input id="speed" type="range" min="0" max="100" step="1" value="40" />
         <span class="val" id="speedVal">–</span>
       </div>
-      <p class="fine"><kbd>space</kbd> play/pause · <kbd>s</kbd> step · <kbd>r</kbd> restart · <kbd>n</kbd> new array</p>
+      <p class="fine"><kbd>space</kbd> play/pause · <kbd>s</kbd> step · <kbd>r</kbd> restart · <kbd>n</kbd> new array · <kbd>m</kbd> mute</p>
     </section>
 
     <section class="card panel">
@@ -198,7 +218,7 @@
 (() => {
   "use strict";
 
-  const WASM_B64 = "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lMSEgAAgACEGIAAhByAAIQkgACECCwJAIBFBAnRBkISEgABqKAIAIBRKDQAgDUECaiEWIAFBCGohEQwBCyABIBE2AgggASgCECERAkAgAkH//w9LDQAgAkEDdCIHQQA2ApDEhIAAQQAgAkEBaiIANgKAgISAACAHIBFB//8DcSAEcjYClMSEgAAgACEGIAAhByAAIQkgACECCyANQQNqIRYCQCARQQJ0QZCEhIAAaigCACAUSg0AIAFBDGohEQwBCyABIBE2AgwgAUEQaiERCyARIBA2AgAgF0EQdCEQIBdBAnRBkISEgABqKAIAIRQgASgCBCERAkAgAkH//w9LDQAgAkEDdCIHQQA2ApDEhIAAQQAgAkEBaiIANgKAgISAACAHIBFB//8DcSAQcjYClMSEgAAgACEGIAAhByAAIQkgACECCwJAAkAgEUECdEGQhISAAGooAgAgFEoNACAWQQFqIREgASEUDAELIAEoAgghEQJAIAJB//8PSw0AIAJBA3QiB0EANgKQxISAAEEAIAJBAWoiADYCgICEgAAgByARQf//A3EgEHI2ApTEhIAAIAAhBiAAIQcgACEJIAAhAgsCQCARQQJ0QZCEhIAAaigCACAUSg0AIBZBAmohESABQQRqIRQMAQsgASgCDCERAkAgAkH//w9LDQAgAkEDdCIHQQA2ApDEhIAAQQAgAkEBaiIANgKAgISAACAHIBFB//8DcSAQcjYClMSEgAAgACEGIAAhByAAIQkgACECCwJAIBFBAnRBkISEgABqKAIAIBRKDQAgFkEDaiERIAFBCGohFAwBCyABIBE2AgggASgCECETAkAgAkH//w9LDQAgAkEDdCIHQQA2ApDEhIAAQQAgAkEBaiIANgKAgISAACAHIBNB//8DcSAQcjYClMSEgAAgACEGIAAhByAAIQkgACECCyAWQQRqIREgAUEQaiABQQxqIBNBAnRBkISEgABqKAIAIBRKGyEUCyAUIBc2AgBBACARNgKEgISAACABKAIIIhdBAnRBkISEgABqKAIAIRYLIBdBAnRBkISEgABqIBVBkISEgABqIhQoAgA2AgAgFCAWNgIAAkAgFyAMRg0AQQAgCEEBaiIFNgKIgISAACAFIQgLAkACQCACQf//D00NACACIRMMAQsgAkEDdCIAQQE2ApDEhIAAQQAgAkEBaiIUNgKAgISAACAAIBdB//8DcSAScjYClMSEgABBgIAQIQBBgIAQIQZBgIAQIQdBgIAQIQlBgIAQIRMgAkH//w9GDQAgFEEDdCIAIAxB//8DcTYClMSEgAAgAEECNgKQxISAAEEAIAJBAmoiADYCgICEgAAgACEGIAAhByAAIQkgACETCyARQQFqIQQgDCEXIAwhDyALIRQgEyECAkACQAJAAkACQANAIA5BAnRBkISEgABqIhAoAgAhEQJAIAJB//8PSw0AIAJBA3QiACAOQf//A3E2ApTEhIAAIABBCTYCkMSEgABBACACQQFqIgA2AoCAhIAAIAAhBiAAIQcgACEJIAAhEyAAIQILAkACQAJAAkAgESAWTg0AIBdBAnRBkISEgABqIg0oAgAhFSANIBE2AgAgECAVNgIAAkAgFyAORg0AQQAgCEEBaiIFNgKIgISAACAFIQgLAkAgAkH//w9LDQAgAkEDdCIHQQE2ApDEhIAAQQAgAkEBaiIANgKAgISAACAHIA5BEHQgF0H//wNxcjYClMSEgAAgACEGIAAhByAAIQkgACETIAAhAgsCQCAXIA9HDQACQCACQf//D0sNACACQQN0IgAgDkH//wNxNgKUxISAACAAQQI2ApDEhIAAQQAgAkEBaiIANgKAgISAACAAIQYgACEHIAAhCSAAIRMgACECCyAOIQ8LIA5BAWohDiAXQQFqIRcMAQsCQCARIBZGDQAgECAUQX9qIhRBAnRBkISEgABqIg0oAgA2AgAgDSARNgIAAkAgDiAURg0AQQAgCEEBaiIFNgKIgISAACAFIQgLIAJB//8PSw0CIAJBA3QiB0EBNgKQxISAAEEAIAJBAWoiADYCgICEgAAgByAUQRB0IA5B//8DcXI2ApTEhIAAIAAhBiAAIQcgACEJIAAhEyAAIQIMAQsgDkEBaiEOCyAOQQNxDQAgAkH//w9LDQAgAkEDdCIAQQQ2ApDEhIAAQQAgAkEBaiIHNgKAgISAACAAIBdB//8DcSAUQRB0cjYClMSEgAAgAkH//w9GDQEgB0EDdCIAIA5B/P8DcTYClMSEgAAgAEELNgKQxISAAEEAIAJBAmoiADYCgICEgAAgACEGIAAhByAAIQkgACETIAAhAgsgDiAUTg0CIARBAWohBAwBC0GAgBAhAAJAIA4gFE4NAEGAgBAhBkGAgBAhB0GAgBAhCUGAgBAhE0GAgBAhAiAEQQFqIQQMAQsLQQAgBDYChICEgABBgIAQIQAMAQtBACAENgKEgISAACACQf//D0sNAiACQQN0IgBBBDYCkMSEgABBACACQQFqIgc2AoCAhIAAIAAgF0H//wNxIBRBEHRyNgKUxISAAEGAgBAhACACQf//D0cNAQtBgIAQIQZBgIAQIQdBgIAQIQlBgIAQIQIMAgsgB0EDdCIAIA5B//8DcTYClMSEgAAgAEELNgKQxISAAEEAIAJBAmoiADYCgICEgAAgACEGIAAhByAAIQkgACETCwJAIBNB//8PTQ0AIBMhAgwBCyATQQN0IgJBCjYCkMSEgABBACATQQFqIgA2AoCAhIAAIAIgF0H//wNxIA5BEHRyNgKUxISAACAAIQYgACEHIAAhCSAAIQILAkAgCyAORw0AIBcgDEYNAgsgFyAMayIRIAsgDmsiFCARIBRIIhEbIQ0CQCAKQT9KDQAgCkEDdCIUQZSAhIAAaiALIBcgERs2AgAgFEGQgISAAGogDiAMIBEbNgIAIApBAWohCgsgDCAOIBEbIQwgFyALIBEbIQsgDUECTg0ACwsgCkEBTg0ACyAAQf//D0sNASAAQQN0IgIgA0EQdDYClMSEgAAgAkEINgKQxISAACAAQQFqIQALQQAgADYCgICEgAALIAQLCABBkISEgAALCABBkMSEgAALCwBBACgCgICEgAALCwBBACgChICEgAALCwBBACgCiICEgAALBQBBgBAL";
+  const WASM_B64 = "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BDYCDCABQRBqIQQLIAQgAjYCAEEAIAZBAWoiBDYCtICEhgBBACABKAIEIgIgABCCgICAAAJAAkAgAkECdEGwgISAAGooAgAgAEECdEGwgISAAGoiAigCAEoNACABIQIMAQtBACAGQQJqIgQ2ArSAhIYAQQAgASgCCCIJIAAQgoCAgAACQCAJQQJ0QbCAhIAAaigCACACKAIASg0AIAFBBGohAgwBC0EAIAZBA2oiBDYCtICEhgBBACABKAIMIgkgABCCgICAAAJAIAlBAnRBsICEgABqKAIAIAIoAgBKDQAgAUEIaiECDAELQQAgBkEEaiIENgK0gISGACABIAk2AghBACABKAIQIgYgABCCgICAACABQRBqIAFBDGogBkECdEGwgISAAGooAgAgAigCAEobIQILIAIgADYCACABKAIIIQALIABBAnRBsICEgABqIgIoAgAhBiACIBFBsICEgABqIgsoAgA2AgAgCyAGNgIAAkAgACAHRg0AQQAgBUEBaiIFNgK4gISGAAtBASAAIAcQgoCAgAACQEEALQCEgISAACISRQ0AQQAoApiAhIAAIhNBACgCkICEgABODQAgBEEAKAKggISAAEkNACATQQt0IghBwICEhgBqIQZBACgClICEgAAhEQJAAkBBACgCjICEgAAiAEEBSA0AIBFBAUgNASARQX9qIQggAEF/aiEOQQAhCQJAIBFBAUYNACARQQFxIRQgEUH+////B3EhESAAQQF0QX5qIRBBACEAIAYhAkEAIQkDQCACIAAgCG1BAnRBsICEgABqKAIANgIAIAJBBGogDiAAaiAIbUECdEGwgISAAGooAgA2AgAgAkEIaiECIAAgEGohACARIAlBAmoiCUcNAAsgFEUNAgsgBiAJQQJ0aiAJIA5sIAhtQQJ0QbCAhIAAaigCADYCAAwBCyARQQFIDQAgEUEHcSECQQAhAAJAIBFBCEkNACARQfj///8HcSEJQQAhAANAIAZCADcDACAGQRhqQgA3AwAgBkEQakIANwMAIAZBCGpCADcDACAGQSBqIQYgCSAAQQhqIgBHDQALIAJFDQELIAggAEECdGpBwICEhgBqIQADQCAAQQA2AgAgAEEEaiEAIAJBf2oiAg0ACwtBACATQQFqNgKYgISAAEEAQQAoApyAhIAAIARqNgKggISAAAsCQEEALQCAgISAACIVDQACQAJAQQAoArCAhIYAIgBBgIDAAEkNAEEAKAKIgISAACEAQYiAhIAAIQIMAQsgAEEDdCICIAdB//8DcTYCtICEggAgAkECNgKwgISCAEGwgISGACECCyACIABBAWo2AgALQQAoApSAhIAAIhZBB3EhFyAWQQFxIRggFkH4////B3EhGSAWQf7///8HcSERIBZBf2ohBkEAKAKMgISAACIaQX9qIQ4gGkEBdEF+aiEQQQAoApyAhIAAIRtBACgCkICEgAAhHCALKAIAIR0gByELIAchHiAMIRQDQEEAIARBAWoiBDYCtICEhgAgCkECdEGwgISAAGoiHygCACETAkAgEkUNAEEAKAKYgISAACIgIBxODQAgBEEAKAKggISAAEkNACAgQQt0IgJBwICEhgBqIQkCQAJAAkACQCAaQQFIDQAgFkEBSA0DIAYNAUEAIQgMAgsgFkEBSA0CQQAhAAJAIBZBCEkNAEEAIQADQCAJQgA3AwAgCUEYakIANwMAIAlBEGpCADcDACAJQQhqQgA3AwAgCUEgaiEJIBkgAEEIaiIARw0ACyAXRQ0DCyACIABBAnRqQcCAhIYAaiEAIBchAgNAIABBADYCACAAQQRqIQAgAkF/aiICDQAMAwsLQQAhACAJIQJBACEIA0AgAiAAIAZtQQJ0QbCAhIAAaigCADYCACACQQRqIA4gAGogBm1BAnRBsICEgABqKAIANgIAIAJBCGohAiAAIBBqIQAgESAIQQJqIghHDQALIBhFDQELIAkgCEECdGogCCAObCAGbUECdEGwgISAAGooAgA2AgALQQAgBCAbajYCoICEgABBACAgQQFqNgKYgISAAAsCQCAVDQACQAJAQQAoArCAhIYAIgBBgIDAAEkNAEEAKAKIgISAACEAQYiAhIAAIQIMAQsgAEEDdCICIApB//8DcTYCtICEggAgAkEJNgKwgISCAEGwgISGACECCyACIABBAWo2AgALAkACQCATIB1ODQAgC0ECdEGwgISAAGoiACgCACECIAAgEzYCACAfIAI2AgACQCALIApGDQBBACAFQQFqIgU2AriAhIYAC0EBIAsgChCCgICAAAJAIAsgHkcNAAJAIBJFDQBBACgCmICEgAAiEyAcTg0AIARBACgCoICEgABJDQAgE0ELdCICQcCAhIYAaiEJAkACQAJAAkAg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IgZBwICEhgBqIQdBACgClICEgAAhCAJAAkBBACgCjICEgAAiAEEBSA0AIAhBAUgNASAIQX9qIQYgAEF/aiEJQQAhCgJAIAhBAUYNACAIQQFxIQsgCEH+////B3EhCCAAQQF0QX5qIQxBACEAIAchAkEAIQoDQCACIAAgBm1BAnRBsICEgABqKAIANgIAIAJBBGogCSAAaiAGbUECdEGwgISAAGooAgA2AgAgAkEIaiECIAAgDGohACAIIApBAmoiCkcNAAsgC0UNAgsgByAKQQJ0aiAKIAlsIAZtQQJ0QbCAhIAAaigCADYCAAwBCyAIQQFIDQAgCEEHcSECQQAhAAJAIAhBCEkNACAIQfj///8HcSEKQQAhAANAIAdCADcDACAHQRhqQgA3AwAgB0EQakIANwMAIAdBCGpCADcDACAHQSBqIQcgCiAAQQhqIgBHDQALIAJFDQELIAYgAEECdGpBwICEhgBqIQADQCAAQQA2AgAgAEEEaiEAIAJBf2oiAg0ACwtBACAFQQFqNgKYgISAAEEAQQAoApyAhIAAIARqNgKggISAAAtBAC0AgICEgAANAAJAAkBBACgCsICEhgAiAEGAgMAASQ0AQQAoAoiAhIAAIQBBiICEgAAhAgwBCyAAQQN0IgIgA0EQdDYCtICEggAgAkEINgKwgISCAEGwgISGACECCyACIABBAWo2AgALIAFBIGokgICAgAAgBAviBAELfwJAQQAtAISAhIAARQ0AQQAoApiAhIAAIgNBACgCkICEgABODQBBACgCtICEhgAiBEEAKAKggISAAEkNACADQQt0IgVBwICEhgBqIQZBACgClICEgAAhBwJAAkBBACgCjICEgAAiCEEBSA0AIAdBAUgNASAHQX9qIQUgCEF/aiEJQQAhCgJAIAdBAUYNACAHQQFxIQsgB0H+////B3EhByAIQQF0QX5qIQxBACEIIAYhDUEAIQoDQCANIAggBW1BAnRBsICEgABqKAIANgIAIA1BBGogCSAIaiAFbUECdEGwgISAAGooAgA2AgAgDUEIaiENIAggDGohCCAHIApBAmoiCkcNAAsgC0UNAgsgBiAKQQJ0aiAKIAlsIAVtQQJ0QbCAhIAAaigCADYCAAwBCyAHQQFIDQAgB0EHcSENQQAhCAJAIAdBCEkNACAHQfj///8HcSEKQQAhCANAIAZCADcDACAGQRhqQgA3AwAgBkEQakIANwMAIAZBCGpCADcDACAGQSBqIQYgCiAIQQhqIghHDQALIA1FDQELIAUgCEECdGpBwICEhgBqIQgDQCAIQQA2AgAgCEEEaiEIIA1Bf2oiDQ0ACwtBACADQQFqNgKYgISAAEEAQQAoApyAhIAAIARqNgKggISAAAsCQEEALQCAgISAAA0AAkACQEEAKAKwgISGACIIQYCAwABJDQBBACgCiICEgAAhCEGIgISAACENDAELIAhBA3QiDSAANgKwgISCACANIAJBEHQgAUH//wNxcjYCtICEggBBsICEhgAhDQsgDSAIQQFqNgIACwu5BwEJf0EAIQNBAEEBOgCAgISAAEEAIABBACAAQQBKGyIEQYCAwAAgBEGAgMAASBsiBDYCjICEgABBACABQQIgAUECShsiAUGAAiABQYACSBsiBTYCkICEgABBACACQQggAkEIShsiAUGABCABQYAESBsiBjYClICEgABBAEEANgKIgISAAEEBIQEDQCADIARqIQNBASABdCECIAFBAWohASACIARJDQALQQAhAkEAQQE6AISAhIAAQQBBASADQQEgA0EBSxsiASAFbiAFIAFLGyIBNgKggISAAEEAIAE2ApyAhIAAAkACQCAAQQBKDQAgBkEHcSEDIAZBAnRBYHEhAkEAIQEDQCABQdiAhIYAakIANwMAIAFB0ICEhgBqQgA3AwAgAUHIgISGAGpCADcDACABQcCAhIYAakIANwMAIAIgAUEgaiIBRw0ACyADRQ0BIAFBwICEhgBqIQEDQCABQQA2AgAgAUEEaiEBIANBf2oiAw0ADAILCyAEQX9qIQcCQCAGQX9qIghFDQAgBkEBcSEJIAZB/gdxIQogBEEBdEF+aiELQQAhAUHAgISGACEDQQAhAgNAIAMgASAIbUECdEGwgISAAGooAgA2AgAgA0EEaiAHIAFqIAhtQQJ0QbCAhIAAaigCADYCACADQQhqIQMgASALaiEBIAogAkECaiICRw0ACyAJRQ0BCyACQQJ0IAIgB2wgCG1BAnRBsICEgABqKAIANgLAgISGAAtBAEEBNgKYgISAACAEEIGAgIAAGgJAQQAoApiAhIAAIgkgBU4NACAJQQt0QcCAhIYAaiEIAkACQCAAQQBKDQAgBkEHcSEDIAZBAnRBYHEhAkEAIQQDQCAIIARqIgFCADcDACABQRhqQgA3AwAgAUEQakIANwMAIAFBCGpCADcDACACIARBIGoiBEcNAAsgA0UNASAIIARqIQEDQCABQQA2AgAgAUEEaiEBIANBf2oiAw0ADAILCyAEQX9qIQcCQAJAIAZBf2oiAg0AQQAhAwwBCyAGQQFxIQAgBkH+B3EhCiAEQQF0QX5qIQtBACEBIAghBEEAIQMDQCAEIAEgAm1BAnRBsICEgABqKAIANgIAIARBBGogByABaiACbUECdEGwgISAAGooAgA2AgAgBEEIaiEEIAEgC2ohASAKIANBAmoiA0cNAAsgAEUNAQsgCCADQQJ0aiADIAdsIAJtQQJ0QbCAhIAAaigCADYCAAtBACAJQQFqIgk2ApiAhIAAC0EAQQA6AISAhIAAIAkLCABBsICEgAALCABBsICEggALCwBBACgCsICEhgALBwBBgIDAAAsLAEEAKAKIgISAAAsLAEEAKAK0gISGAAsLAEEAKAK4gISGAAsIAEHAgISGAAsLAEEAKAKYgISAAAsLAEEAKAKUgISAAAsHAEGAgMAACw==";
   const OP = { CMP: 0, SWAP: 1, PIVOT: 2, RANGE: 3, LANE: 4, ORD: 5, REV: 6, INS: 7, DONE: 8, CMPV: 9, SET: 10, LANE2: 11 };
 
   const $ = (id) => document.getElementById(id);
@@ -207,7 +227,9 @@
 
   const ui = {
     play: $("play"), step: $("stepBtn"), reset: $("resetBtn"), shuffle: $("shuffleBtn"),
-    scrub: $("scrub"), size: $("size"), sizeVal: $("sizeVal"), pattern: $("pattern"),
+    sound: $("sound"),
+    scrub: $("scrub"), size: $("size"), sizeNum: $("sizeNum"), pattern: $("pattern"),
+    modeNote: $("modeNote"), legend: $("legend"),
     speed: $("speed"), speedVal: $("speedVal"), now: $("now"), badge: $("badge"),
     sN: $("sN"), sStep: $("sStep"), sCmp: $("sCmp"), sSwap: $("sSwap"),
     sRatio: $("sRatio"), sMs: $("sMs"),
@@ -216,13 +238,110 @@
   let wasm = null;
   let wasmBytes = 0;
 
+  /* ---------- audio: bubbly blips, synthesized, zero assets ---------- */
+  const audio = (() => {
+    const SCALE = [0, 2, 4, 7, 9]; // pentatonic: no bad intervals, even at random
+    let ctx = null, comp = null, master = null;
+    let muted = false, lastT = -1;
+    const MIN_GAP = 1 / 55;
+
+    function ensure() {
+      if (ctx) return ctx;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      ctx = new AC();
+      comp = ctx.createDynamicsCompressor();
+      comp.threshold.value = -18;
+      comp.ratio.value = 6;
+      master = ctx.createGain();
+      master.gain.value = 0.55;
+      comp.connect(master);
+      master.connect(ctx.destination);
+      showState();
+      return ctx;
+    }
+
+    function showState() {
+      document.body.dataset.snd = muted ? "muted" : ctx ? ctx.state : "off";
+    }
+
+    function resume() {
+      const c = ensure();
+      if (c && c.state === "suspended") c.resume().then(showState).catch(() => {});
+    }
+
+    // Map a value to a pentatonic pitch across ~2.5 octaves.
+    function pitch(v, maxV) {
+      const s = Math.max(0, Math.min(14, Math.round((v / Math.max(1, maxV)) * 14)));
+      return 130.81 * Math.pow(2, (Math.floor(s / 5) * 12 + SCALE[s % 5]) / 12);
+    }
+
+    function tone(freq, { type = "sine", dur = 0.05, gain = 0.03, bend = 1, delay = 0, force = false } = {}) {
+      if (muted) return;
+      const c = ensure();
+      if (!c) return;
+      if (c.state === "suspended") c.resume().then(showState).catch(() => {});
+      const now = c.currentTime;
+      if (!force && now - lastT < MIN_GAP) return; // keep fast playback musical
+      lastT = now;
+      const t0 = now + delay;
+      const osc = c.createOscillator();
+      const g = c.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(Math.max(20, freq * bend), t0);
+      if (bend !== 1) osc.frequency.exponentialRampToValueAtTime(Math.max(20, freq), t0 + dur * 0.85);
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(gain, t0 + 0.005);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      osc.connect(g);
+      g.connect(comp);
+      osc.start(t0);
+      osc.stop(t0 + dur + 0.03);
+    }
+
+    return {
+      resume,
+      toggle() {
+        muted = !muted;
+        if (!muted) resume();
+        showState();
+        return muted;
+      },
+      compare(v, maxV) { tone(pitch(v, maxV), { type: "triangle", dur: 0.04, gain: 0.024 }); },
+      swap(v, maxV) { tone(pitch(v, maxV) * 1.5, { type: "sine", dur: 0.065, gain: 0.045, bend: 1.24 }); },
+      pivot(v, maxV) { tone(pitch(v, maxV) * 2, { type: "triangle", dur: 0.14, gain: 0.038 }); },
+      settle(v, maxV) { tone(pitch(v, maxV) * 2, { type: "sine", dur: 0.11, gain: 0.028 }); },
+      tick(v, maxV) { tone(pitch(v, maxV) * 2, { type: "sine", dur: 0.07, gain: 0.02 }); },
+      done() {
+        const base = 261.63;
+        [0, 4, 7, 12, 16].forEach((semis, i) => {
+          tone(base * Math.pow(2, semis / 12), {
+            type: "triangle", dur: 0.2, gain: 0.04, delay: i * 0.07, force: true,
+          });
+        });
+      },
+    };
+  })();
+
   const eng = {
     base: null, vals: null, trace: null, total: 0, i: 0,
     settled: null, heat: null, lanes: [], active: [-1, -1], pivot: -1, gate: [-1, -1],
-    cmp: 0, swaps: 0, last: "", acc: 0, playing: false, maxV: 1, ms: null,
+    cmp: 0, swaps: 0, last: "", acc: 0, playing: false, maxV: 1, ms: null, quiet: false,
+    mode: "trace", lapse: null, sortedOk: true,
   };
 
   const speedOf = (v) => Math.pow(10, 1 + (v / 100) * 4); // 10 .. 100k steps/s
+
+  /* Per-step tracing is O(n log n) records, so it is capped. Above the cap the
+   * wasm module samples strided snapshots instead (time-lapse mode). */
+  const TRACE_MAX_N = 8192;
+  const LAPSE_FRAMES = 256;
+  const LAPSE_BUCKETS = 512;
+  const maxN = () => (wasm ? wasm.max_n() : 1048576);
+  const sizeFromSlider = (v) =>
+    Math.max(16, Math.min(maxN(), Math.round(16 * Math.pow(2, (v / 100) * 16))));
+  const sliderFromSize = (n) =>
+    Math.max(0, Math.min(100, Math.round((Math.log2(Math.max(16, n) / 16) / 16) * 100)));
 
   /* ---------- wasm ---------- */
   function decode(b64) {
@@ -244,13 +363,37 @@
       trace: new Uint32Array(view),
       cmp: wasm.cmp_total(),
       swaps: wasm.swap_total(),
+      overflow: wasm.trace_over(),
       sorted: new Int32Array(new Int32Array(mem.buffer, wasm.arr_ptr(), n)),
     };
   }
 
+  function sortLapseInWasm(values) {
+    const n = values.length;
+    const mem = wasm.memory;
+    new Int32Array(mem.buffer, wasm.arr_ptr(), n).set(values);
+    const frames = wasm.ssort_lapse(n, LAPSE_FRAMES, LAPSE_BUCKETS);
+    const buckets = wasm.snap_bucket_count();
+    const view = new Int32Array(mem.buffer, wasm.snap_ptr(), frames * buckets);
+    return {
+      frames,
+      buckets,
+      data: new Int32Array(view),
+      f: 0,
+      cmp: wasm.cmp_total(),
+      swaps: wasm.swap_total(),
+      sorted: new Int32Array(mem.buffer, wasm.arr_ptr(), n),
+    };
+  }
+
+  function sortedView(view, n) {
+    for (let i = 1; i < n; i++) if (view[i - 1] > view[i]) return false;
+    return true;
+  }
+
   /* ---------- array patterns ---------- */
   function makeArray(pattern, n) {
-    const a = new Array(n);
+    const a = new Int32Array(n);
     switch (pattern) {
       case "sorted": for (let i = 0; i < n; i++) a[i] = i + 1; break;
       case "reversed": for (let i = 0; i < n; i++) a[i] = n - i; break;
@@ -280,6 +423,17 @@
 
   /* ---------- playback ---------- */
   function resetPlayback() {
+    eng.maxV = 1;
+    for (let i = 0; i < eng.base.length; i++) if (eng.base[i] > eng.maxV) eng.maxV = eng.base[i];
+    if (eng.mode === "lapse") {
+      eng.lapse.f = 0;
+      eng.i = 0;
+      eng.total = eng.lapse.frames;
+      eng.last = `time-lapse · ${eng.lapse.frames} frames over n=${eng.base.length}`;
+      ui.scrub.max = String(Math.max(1, eng.lapse.frames - 1));
+      ui.scrub.value = "0";
+      return;
+    }
     eng.vals = Int32Array.from(eng.base);
     eng.settled = new Uint8Array(eng.base.length);
     eng.heat = new Float32Array(eng.base.length);
@@ -289,7 +443,6 @@
     eng.gate = [-1, -1];
     eng.i = 0;
     eng.last = "ready";
-    eng.maxV = Math.max(1, ...eng.base);
     ui.scrub.max = String(Math.max(1, eng.total));
     ui.scrub.value = "0";
   }
@@ -314,20 +467,24 @@
     switch (op) {
       case OP.CMP:
         heatAt(x, 0.5); heatAt(y, 0.5);
+        if (!eng.quiet) audio.compare(Math.min(vals[x], vals[y]), eng.maxV);
         eng.last = `compare  a[${x}] ${vals[x]} · a[${y}] ${vals[y]}`;
         break;
       case OP.CMPV:
         heatAt(x, 0.5); heatAt(eng.pivot, 0.4);
+        if (!eng.quiet) audio.compare(vals[x], eng.maxV);
         eng.last = `compare  a[${x}] ${vals[x]} · pivot ${eng.pivot >= 0 ? vals[eng.pivot] : "?"}`;
         break;
       case OP.SWAP: {
         const t = vals[x]; vals[x] = vals[y]; vals[y] = t;
         heatAt(x, 1.0); heatAt(y, 1.0);
+        if (!eng.quiet) audio.swap(vals[x], eng.maxV);
         eng.last = `swap     a[${x}] ↔ a[${y}]`;
         break;
       }
       case OP.PIVOT:
         eng.pivot = x; heatAt(x, 1.2);
+        if (!eng.quiet) audio.pivot(vals[x], eng.maxV);
         eng.last = `pivot    ${vals[x]} parked at ${x}`;
         break;
       case OP.RANGE:
@@ -362,11 +519,13 @@
       case OP.SET:
         settleRange(x, y);
         heatAt(x, 0.45); heatAt(y - 1, 0.45);
+        if (!eng.quiet) audio.settle(vals[x], eng.maxV);
         break;
       case OP.DONE:
         settleRange(0, eng.settled.length);
         for (let i = 0; i < eng.heat.length; i++) eng.heat[i] += 0.5;
         eng.active = [-1, -1]; eng.lanes = []; eng.pivot = -1;
+        if (!eng.quiet) audio.done();
         eng.last = `done — ${eng.total} records`;
         break;
     }
@@ -375,12 +534,24 @@
   }
 
   function seek(target) {
+    if (eng.mode === "lapse") {
+      eng.lapse.f = Math.max(0, Math.min(eng.lapse.frames - 1, target | 0));
+      eng.i = Math.floor(eng.lapse.f);
+      ui.scrub.value = String(eng.lapse.f);
+      return;
+    }
     target = Math.max(0, Math.min(eng.total, target | 0));
-    if (target < eng.i) {
-      resetPlayback();
-      while (eng.i < target) applyStep();
-    } else {
-      while (eng.i < target) applyStep();
+    const wasQuiet = eng.quiet;
+    eng.quiet = true;
+    try {
+      if (target < eng.i) {
+        resetPlayback();
+        while (eng.i < target) applyStep();
+      } else {
+        while (eng.i < target) applyStep();
+      }
+    } finally {
+      eng.quiet = wasQuiet;
     }
     ui.scrub.value = String(eng.i);
   }
@@ -388,26 +559,47 @@
   /* ---------- run ---------- */
   function run() {
     const pattern = ui.pattern.value;
-    const n = Math.min(parseInt(ui.size.value, 10), wasm.max_n());
+    const n = Math.max(16, Math.min(maxN(), parseInt(ui.sizeNum.value, 10) || 192));
+    ui.sizeNum.value = String(n);
+    ui.size.value = String(sliderFromSize(n));
+
     eng.base = makeArray(pattern, n);
     const t0 = performance.now();
-    const out = sortInWasm(eng.base);
-    eng.ms = performance.now() - t0;
-    eng.trace = out.trace;
-    eng.total = out.trace.length / 2;
-    eng.cmp = out.cmp;
-    eng.swaps = out.swaps;
+    let out = n <= TRACE_MAX_N ? sortInWasm(eng.base) : null;
+    const expect = out ? Int32Array.from(eng.base).sort() : null;
 
-    // trust but verify: the wasm result and a JS sort must agree.
-    const expect = [...eng.base].sort((a, b) => a - b);
-    let ok = true;
-    for (let i = 0; i < n; i++) if (out.sorted[i] !== expect[i]) { ok = false; break; }
-    if (!ok) console.error("wasm sort mismatch — visualization would be wrong");
-    document.body.dataset.sorted = ok ? "1" : "0";
+    if (out && out.overflow === 0) {
+      eng.mode = "trace";
+      eng.trace = out.trace;
+      eng.total = out.trace.length / 2;
+      eng.cmp = out.cmp;
+      eng.swaps = out.swaps;
+      let ok = true;
+      for (let i = 0; i < n; i++) if (out.sorted[i] !== expect[i]) { ok = false; break; }
+      eng.sortedOk = ok;
+    } else {
+      eng.mode = "lapse";
+      const lap = sortLapseInWasm(eng.base);
+      eng.lapse = lap;
+      eng.cmp = lap.cmp;
+      eng.swaps = lap.swaps;
+      eng.total = lap.frames;
+      eng.sortedOk = sortedView(lap.sorted, n);
+    }
+    eng.ms = performance.now() - t0;
+    document.body.dataset.sorted = eng.sortedOk ? "1" : "0";
+    if (!eng.sortedOk) console.error("wasm sort mismatch — visualization would be wrong");
+
+    ui.legend.style.display = eng.mode === "lapse" ? "none" : "";
+    ui.modeNote.textContent =
+      eng.mode === "lapse"
+        ? `time-lapse: ${eng.lapse.frames} sampled frames — n is above ${TRACE_MAX_N.toLocaleString()}`
+        : "per-step trace: every compare and swap";
 
     resetPlayback();
     eng.playing = true;
     ui.play.textContent = "Pause";
+    updateSpeedLabel();
     syncStats();
     draw();
   }
@@ -440,6 +632,7 @@
   }
 
   function draw() {
+    if (eng.mode === "lapse") return drawLapse();
     const W = canvas.width, H = canvas.height;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, W, H);
@@ -482,35 +675,59 @@
       return null;
     };
 
-    for (let i = 0; i < n; i++) {
-      const v = eng.vals[i];
-      const h = Math.max(1 * dpr, (v / eng.maxV) * plotH);
-      const x = padX + i * bw;
-      const y = padT + plotH - h;
+    if (bw < 1) {
+      // More elements than pixels: aggregate each device column by mean value
+      // so the silhouette reads as an envelope instead of a solid slab.
+      const cols = Math.max(1, Math.floor(plotW));
+      const per = n / cols;
+      for (let c = 0; c < cols; c++) {
+        const lo = Math.floor(c * per);
+        const hi = Math.max(lo + 1, Math.floor((c + 1) * per));
+        let sum = 0, heat = 0, settled = 0, cnt = 0;
+        for (let i = lo; i < hi && i < n; i++) {
+          sum += eng.vals[i]; heat += eng.heat[i]; settled += eng.settled[i]; cnt++;
+        }
+        if (!cnt) continue;
+        const h = Math.max(1, (sum / cnt / eng.maxV) * plotH);
+        const x = padX + c;
+        const y = padT + plotH - h;
+        let base = settled * 2 > cnt ? PAL.settled : laneColor(lo) || (lo >= a0 && lo < a1 ? PAL.pending : PAL.idle);
+        const hh = Math.min(1.4, heat / cnt);
+        const col = hh > 0 ? mix(base, PAL.hot, Math.min(0.8, hh * 0.55)) : base;
+        ctx.fillStyle = `rgba(${col[0] | 0},${col[1] | 0},${col[2] | 0},1)`;
+        ctx.fillRect(x, y, 1, Math.ceil(h));
+      }
+    } else {
+      for (let i = 0; i < n; i++) {
+        const v = eng.vals[i];
+        const h = Math.max(1 * dpr, (v / eng.maxV) * plotH);
+        const x = padX + i * bw;
+        const y = padT + plotH - h;
 
-      let base = eng.settled[i] ? PAL.settled : laneColor(i) || (i >= a0 && i < a1 ? PAL.pending : PAL.idle);
-      const hh = Math.min(1.4, eng.heat[i]);
-      let col = hh > 0 ? mix(base, PAL.hot, Math.min(0.8, hh * 0.55)) : base;
-      if (i === eng.pivot) col = mix(PAL.pivot, PAL.hot, Math.min(0.6, hh * 0.45));
+        let base = eng.settled[i] ? PAL.settled : laneColor(i) || (i >= a0 && i < a1 ? PAL.pending : PAL.idle);
+        const hh = Math.min(1.4, eng.heat[i]);
+        let col = hh > 0 ? mix(base, PAL.hot, Math.min(0.8, hh * 0.55)) : base;
+        if (i === eng.pivot) col = mix(PAL.pivot, PAL.hot, Math.min(0.6, hh * 0.45));
 
-      // dim outside the active window so the working range reads clearly
-      const dim = !eng.settled[i] && a1 > a0 && (i < a0 || i >= a1) ? 0.55 : 1;
-      const w = Math.max(1, bw - gap);
-      const r = Math.min(3 * dpr, w * 0.5);
-      ctx.fillStyle = `rgba(${col[0] | 0},${col[1] | 0},${col[2] | 0},${dim})`;
-      if (bw < 2 * dpr) {
-        // sub-2px columns: snap to the device pixel grid, otherwise fractional
-        // rects produce moiré stripes instead of a silhouette.
-        ctx.fillRect(Math.round(x), Math.round(y), 1, Math.ceil(h));
-      } else if (bw > 5 * dpr && typeof ctx.roundRect === "function") {
-        ctx.beginPath();
-        ctx.roundRect(x + gap / 2, y, w, h, [r, r, 0, 0]);
-        ctx.fill();
-        // top highlight
-        ctx.fillStyle = `rgba(255,255,255,${0.16 * dim})`;
-        ctx.fillRect(x + gap / 2, y, w, Math.min(2.5 * dpr, h * 0.18));
-      } else {
-        ctx.fillRect(x + gap / 2, y, w, h);
+        // dim outside the active window so the working range reads clearly
+        const dim = !eng.settled[i] && a1 > a0 && (i < a0 || i >= a1) ? 0.55 : 1;
+        const w = Math.max(1, bw - gap);
+        const r = Math.min(3 * dpr, w * 0.5);
+        ctx.fillStyle = `rgba(${col[0] | 0},${col[1] | 0},${col[2] | 0},${dim})`;
+        if (bw < 2 * dpr) {
+          // sub-2px columns: snap to the device pixel grid, otherwise fractional
+          // rects produce moiré stripes instead of a silhouette.
+          ctx.fillRect(Math.round(x), Math.round(y), 1, Math.ceil(h));
+        } else if (bw > 5 * dpr && typeof ctx.roundRect === "function") {
+          ctx.beginPath();
+          ctx.roundRect(x + gap / 2, y, w, h, [r, r, 0, 0]);
+          ctx.fill();
+          // top highlight
+          ctx.fillStyle = `rgba(255,255,255,${0.16 * dim})`;
+          ctx.fillRect(x + gap / 2, y, w, Math.min(2.5 * dpr, h * 0.18));
+        } else {
+          ctx.fillRect(x + gap / 2, y, w, h);
+        }
       }
     }
 
@@ -548,6 +765,58 @@
     ctx.stroke();
   }
 
+  /*
+   * Time-lapse rendering: bars come from two sampled snapshots, interpolated,
+   * so the array morphs smoothly instead of stepping through frames.
+   */
+  function drawLapse() {
+    const W = canvas.width, H = canvas.height;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    const lap = eng.lapse;
+    if (!lap || !lap.frames) return;
+
+    const padT = 26 * dpr, padB = 20 * dpr, padX = 6 * dpr;
+    const plotW = W - padX * 2;
+    const plotH = H - padT - padB;
+    const { frames, buckets, data } = lap;
+    const bw = plotW / buckets;
+    const f0 = Math.max(0, Math.min(frames - 1, Math.floor(lap.f)));
+    const f1 = Math.min(frames - 1, f0 + 1);
+    const t = Math.max(0, Math.min(1, lap.f - f0));
+    const maxV = Math.max(1, eng.maxV);
+    const row0 = f0 * buckets, row1 = f1 * buckets;
+    const dense = bw < 2 * dpr;
+
+    for (let b = 0; b < buckets; b++) {
+      const v = data[row0 + b] + (data[row1 + b] - data[row0 + b]) * t;
+      const h = Math.max(1, (v / maxV) * plotH);
+      const x = padX + b * bw;
+      const y = padT + plotH - h;
+      const c = mix([66, 106, 224], [52, 196, 136], v / maxV);
+      ctx.fillStyle = `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},0.95)`;
+      if (dense) {
+        ctx.fillRect(Math.round(x), Math.round(y), 1, Math.ceil(h));
+      } else {
+        const w = Math.max(1, bw - 1);
+        if (typeof ctx.roundRect === "function") {
+          ctx.beginPath();
+          ctx.roundRect(x, y, w, h, [2, 2, 0, 0]);
+          ctx.fill();
+        } else {
+          ctx.fillRect(x, y, w, h);
+        }
+      }
+    }
+
+    ctx.strokeStyle = "rgba(70,90,140,0.35)";
+    ctx.lineWidth = 1 * dpr;
+    ctx.beginPath();
+    ctx.moveTo(padX, padT + plotH + 0.5 * dpr);
+    ctx.lineTo(padX + plotW, padT + plotH + 0.5 * dpr);
+    ctx.stroke();
+  }
+
   function decay() {
     if (!eng.heat) return;
     for (let i = 0; i < eng.heat.length; i++) {
@@ -555,6 +824,14 @@
       if (h > 0.003) eng.heat[i] = h * 0.62;
       else eng.heat[i] = 0;
     }
+  }
+
+  function updateSpeedLabel() {
+    const rate = speedOf(parseInt(ui.speed.value, 10));
+    ui.speedVal.textContent =
+      eng.mode === "lapse"
+        ? Math.round(Math.max(2, Math.min(160, rate / 12))) + " fps"
+        : Math.round(rate).toLocaleString() + "/s";
   }
 
   function syncStats() {
@@ -577,20 +854,37 @@
 
     if (eng.playing) {
       const rate = speedOf(parseInt(ui.speed.value, 10));
-      eng.acc += (rate * dt) / 1000;
-      let budget = Math.floor(eng.acc);
-      eng.acc -= budget;
-      budget = Math.min(budget, 30000);
-      let done = false;
-      for (let k = 0; k < budget; k++) {
-        if (!applyStep()) { done = true; break; }
+      if (eng.mode === "lapse") {
+        const lap = eng.lapse;
+        const fps = Math.max(2, Math.min(160, rate / 12));
+        const before = Math.floor(lap.f);
+        lap.f = Math.min(lap.frames - 1, lap.f + (fps * dt) / 1000);
+        eng.i = Math.floor(lap.f);
+        if (eng.i !== before && !eng.quiet) {
+          const mid = lap.buckets >> 1;
+          audio.tick(lap.data[eng.i * lap.buckets + mid], eng.maxV);
+        }
+        if (lap.f >= lap.frames - 1) {
+          eng.playing = false;
+          ui.play.textContent = "Play";
+        }
+        ui.scrub.value = String(eng.i);
+      } else {
+        eng.acc += (rate * dt) / 1000;
+        let budget = Math.floor(eng.acc);
+        eng.acc -= budget;
+        budget = Math.min(budget, 30000);
+        let done = false;
+        for (let k = 0; k < budget; k++) {
+          if (!applyStep()) { done = true; break; }
+        }
+        if (eng.i >= eng.total) done = true;
+        if (done) {
+          eng.playing = false;
+          ui.play.textContent = "Play";
+        }
+        ui.scrub.value = String(eng.i);
       }
-      if (eng.i >= eng.total) done = true;
-      if (done) {
-        eng.playing = false;
-        ui.play.textContent = "Play";
-      }
-      ui.scrub.value = String(eng.i);
       syncStats();
     }
 
@@ -601,16 +895,27 @@
 
   /* ---------- wiring ---------- */
   function bind() {
+    let sizeTimer = 0;
+    const scheduleRun = () => {
+      clearTimeout(sizeTimer);
+      sizeTimer = setTimeout(run, 120);
+    };
+
     ui.play.addEventListener("click", () => {
-      if (eng.i >= eng.total) seek(0);
+      const atEnd = eng.mode === "lapse" ? eng.lapse.f >= eng.lapse.frames - 1 : eng.i >= eng.total;
+      if (atEnd) seek(0);
       eng.playing = !eng.playing;
       ui.play.textContent = eng.playing ? "Pause" : "Play";
     });
     ui.step.addEventListener("click", () => {
       eng.playing = false;
       ui.play.textContent = "Play";
-      applyStep();
-      ui.scrub.value = String(eng.i);
+      if (eng.mode === "lapse") {
+        seek(eng.lapse.f + 1);
+      } else {
+        applyStep();
+        ui.scrub.value = String(eng.i);
+      }
       syncStats();
       draw();
     });
@@ -622,6 +927,13 @@
     });
     ui.shuffle.addEventListener("click", () => run());
 
+    ui.sound.addEventListener("click", () => {
+      const muted = audio.toggle();
+      ui.sound.textContent = muted ? "♪ off" : "♪ on";
+      ui.sound.setAttribute("aria-pressed", String(!muted));
+      if (!muted) audio.compare(eng.maxV * 0.6, eng.maxV);
+    });
+
     ui.scrub.addEventListener("input", () => {
       eng.playing = false;
       ui.play.textContent = "Play";
@@ -631,14 +943,34 @@
     });
 
     ui.size.addEventListener("input", () => {
-      ui.sizeVal.textContent = ui.size.value;
+      ui.sizeNum.value = String(sizeFromSlider(parseInt(ui.size.value, 10)));
+      scheduleRun();
+    });
+    ui.size.addEventListener("change", () => {
+      clearTimeout(sizeTimer);
       run();
+    });
+    ui.sizeNum.addEventListener("change", () => {
+      let n = parseInt(ui.sizeNum.value, 10);
+      if (!Number.isFinite(n)) n = 192;
+      n = Math.max(16, Math.min(maxN(), n));
+      ui.sizeNum.value = String(n);
+      ui.size.value = String(sliderFromSize(n));
+      clearTimeout(sizeTimer);
+      run();
+    });
+    document.querySelectorAll(".chipbtn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const n = Math.max(16, Math.min(maxN(), parseInt(btn.dataset.n, 10)));
+        ui.sizeNum.value = String(n);
+        ui.size.value = String(sliderFromSize(n));
+        clearTimeout(sizeTimer);
+        run();
+      });
     });
     ui.pattern.addEventListener("change", () => run());
 
-    ui.speed.addEventListener("input", () => {
-      ui.speedVal.textContent = Math.round(speedOf(parseInt(ui.speed.value, 10))).toLocaleString() + "/s";
-    });
+    ui.speed.addEventListener("input", updateSpeedLabel);
 
     window.addEventListener("keydown", (e) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
@@ -646,7 +978,13 @@
       else if (e.key === "s") ui.step.click();
       else if (e.key === "r") ui.reset.click();
       else if (e.key === "n") ui.shuffle.click();
+      else if (e.key === "m") ui.sound.click();
     });
+
+    // AudioContext needs a gesture; browsers start it suspended.
+    const wake = () => audio.resume();
+    window.addEventListener("pointerdown", wake, { passive: true });
+    window.addEventListener("keydown", wake);
 
     const ro = new ResizeObserver(() => { resize(); draw(); });
     ro.observe(canvas);
@@ -666,14 +1004,14 @@
     wasm = instance.exports;
 
     ui.badge.textContent = `wasm ${(wasmBytes / 1024).toFixed(1)} KB · 0 imports · 1 file`;
-    ui.speedVal.textContent = Math.round(speedOf(parseInt(ui.speed.value, 10))).toLocaleString() + "/s";
+    updateSpeedLabel();
 
     // Deep-linkable state: ?n=256&pattern=dupes&step=1200 pauses at that step.
     const q = new URLSearchParams(location.search);
     if (q.has("n")) {
       const n = Math.max(16, Math.min(wasm.max_n(), parseInt(q.get("n"), 10) || 0));
-      ui.size.value = String(n);
-      ui.sizeVal.textContent = String(n);
+      ui.sizeNum.value = String(n);
+      ui.size.value = String(sliderFromSize(n));
     }
     if (q.has("pattern")) {
       const p = q.get("pattern");
@@ -681,7 +1019,7 @@
     }
     if (q.has("speed")) {
       ui.speed.value = String(Math.max(0, Math.min(100, parseInt(q.get("speed"), 10) || 0)));
-      ui.speedVal.textContent = Math.round(speedOf(parseInt(ui.speed.value, 10))).toLocaleString() + "/s";
+      updateSpeedLabel();
     }
 
     resize();

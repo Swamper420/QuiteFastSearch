@@ -114,7 +114,51 @@ function shuffle(n, seed) {
   return v;
 }
 
-const sizes = [0, 1, 2, 3, 4, 5, 7, 8, 16, 17, 23, 24, 25, 33, 40, 41, 100, 257, 512, 1024, 2048];
+// Time-lapse path: no per-operation trace, fixed-size sampled snapshots.
+function runLapse(values, frames = 256, buckets = 512) {
+  const n = values.length;
+  new Int32Array(memory.buffer, ex.arr_ptr(), n).set(values);
+  const got = ex.ssort_lapse(n, frames, buckets);
+  const bk = ex.snap_bucket_count();
+  const snap = new Int32Array(new Int32Array(memory.buffer, ex.snap_ptr(), got * bk));
+  const sorted = new Int32Array(memory.buffer, ex.arr_ptr(), n);
+  return { frames: got, buckets: bk, snap, sorted, cmp: ex.cmp_total(), swaps: ex.swap_total() };
+}
+
+function checkLapse(name, values) {
+  checks++;
+  const n = values.length;
+  const r = runLapse(values);
+  const expected = Int32Array.from(values).sort();
+
+  for (let i = 0; i < n; i++) {
+    if (r.sorted[i] !== expected[i]) {
+      failures++;
+      console.error(`FAIL lapse sort ${name}: wrong element at ${i}`);
+      return;
+    }
+  }
+  if (r.frames < 2 || r.frames > 256 || r.buckets !== 512) {
+    failures++;
+    console.error(`FAIL lapse shape ${name}: ${r.frames} frames x ${r.buckets}`);
+    return;
+  }
+
+  const first = values[0], last = expected[n - 1];
+  if (r.snap[0] !== first || r.snap[r.snap.length - 1] !== last) {
+    failures++;
+    console.error(`FAIL lapse endpoints ${name}: ${r.snap[0]}..${r.snap[r.snap.length - 1]}`);
+    return;
+  }
+
+  const bound = 12 * n * Math.max(1, Math.log2(Math.max(n, 2))) + 256;
+  if (r.cmp > bound) {
+    failures++;
+    console.error(`FAIL lapse budget ${name}: ${r.cmp} > ${bound.toFixed(0)}`);
+  }
+}
+
+const sizes = [0, 1, 2, 3, 4, 5, 7, 8, 16, 17, 23, 24, 25, 33, 40, 41, 100, 257, 512, 1024, 2048, 8192];
 
 for (const n of sizes) {
   check(`random n=${n}`, shuffle(n, 12345 + n));
@@ -172,9 +216,35 @@ for (const n of [1024, 2048]) {
   }
 }
 
-// wasm memory must not exceed the exported allocation after a big sort.
+// Per-step tracing must not overflow its record budget at the largest
+// size the viewer still animates step by step.
+for (const n of [4096, 8192]) {
+  run(shuffle(n, 4242 + n));
+  checks++;
+  if (ex.trace_over() !== 0) {
+    failures++;
+    console.error(`FAIL trace overflow at n=${n}: ${ex.trace_over()} dropped`);
+  }
+  checks++;
+  if (ex.trace_len() > ex.trace_cap()) {
+    failures++;
+    console.error(`FAIL trace over capacity at n=${n}`);
+  }
+}
+
+// Time-lapse path, including the 1M ceiling.
+for (const n of [8193, 65536, 262144]) {
+  checkLapse(`lapse random n=${n}`, shuffle(n, 77 + n));
+  checkLapse(`lapse reversed n=${n}`, Array.from({ length: n }, (_, i) => n - i));
+  checkLapse(`lapse dupes n=${n}`, Array.from({ length: n }, (_, i) => ((i * 2654435761) >>> 0) % 7));
+}
+checkLapse("lapse sorted 1M", Int32Array.from({ length: 1 << 20 }, (_, i) => i + 1));
+checkLapse("lapse reversed 1M", Int32Array.from({ length: 1 << 20 }, (_, i) => (1 << 20) - i));
+checkLapse("lapse random 1M", shuffle(1 << 20, 31337));
+
+// wasm memory must stay at its declared size, no growth during big sorts.
 checks++;
-if (memory.buffer.byteLength !== 16 * 1024 * 1024) {
+if (memory.buffer.byteLength !== 64 * 1024 * 1024) {
   failures++;
   console.error(`FAIL memory grew to ${memory.buffer.byteLength}`);
 }
