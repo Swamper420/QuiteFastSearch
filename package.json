@@ -1,0 +1,14 @@
+{
+  "name": "sluice-sort",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Adaptive three-lane quicksort compiled to WebAssembly, shipped as one HTML file",
+  "type": "module",
+  "scripts": {
+    "build:wasm": "./tools/build-wasm.sh",
+    "build:html": "node tools/build-html.mjs",
+    "build": "./tools/build-wasm.sh && node tools/build-html.mjs",
+    "test": "node test/test.mjs",
+    "check": "npm run build && npm test"
+  }
+}
